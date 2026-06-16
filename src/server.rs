@@ -64,6 +64,9 @@ pub async fn serve<C>(
     } = state;
 
     let shutdown_timeout = config.shutdown_timeout;
+    let max_connections = config.max_connections;
+    let header_read_timeout = config.header_read_timeout;
+    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
 
     tokio::pin!(shutdown);
@@ -83,6 +86,18 @@ pub async fn serve<C>(
                     warn!(%e, "failed to set TCP_NODELAY");
                 }
 
+                let permit = match Arc::clone(&connection_semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            limit = max_connections,
+                            %client_addr,
+                            "max connections reached, dropping connection"
+                        );
+                        continue;
+                    }
+                };
+
                 let client = client.clone();
                 let config = Arc::clone(&config);
                 let semaphore = Arc::clone(&semaphore);
@@ -91,6 +106,7 @@ pub async fn serve<C>(
                 let rate_limiter = rate_limiter.clone();
 
                 connections.spawn(async move {
+                    let _permit = permit;
                     let svc = service_fn(move |req: hyper::Request<Incoming>| {
                         let client = client.clone();
                         let config = Arc::clone(&config);
@@ -148,7 +164,10 @@ pub async fn serve<C>(
                         }
                     });
 
-                    let builder = http1::Builder::new();
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(header_read_timeout);
 
                     let result = match tls_acceptor {
                         Some(acceptor) => {

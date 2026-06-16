@@ -380,6 +380,90 @@ async fn body_within_limit_succeeds() {
 }
 
 #[tokio::test]
+async fn oversized_body_without_content_length_returns_413() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "unreachable").await;
+    let config = test_config_with_body_limit(addr, 100);
+
+    // No declared Content-Length: the up-front header check is bypassed, so
+    // the streaming length limit must reject the oversized body mid-flight.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{addr}/"))
+        .body(Full::new(Bytes::from("x".repeat(1000))))
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        None,
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn response_above_masking_ceiling_streams_unmasked() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "password=secret123").await;
+    // Ceiling of 4 bytes is smaller than the 18-byte response body, so the
+    // proxy streams it through unmasked rather than buffering it.
+    let config = test_config_with_mask_ceiling(addr, 4);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = collect_body(resp.into_body()).await;
+    assert_eq!(body, Bytes::from("password=secret123"));
+}
+
+#[tokio::test]
+async fn response_within_masking_ceiling_is_masked() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "password=secret123").await;
+    let config = test_config_with_mask_ceiling(addr, 1024);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = collect_body(resp.into_body()).await;
+    assert_eq!(body, Bytes::from("password=****"));
+}
+
+#[tokio::test]
 async fn forwarding_headers_injected_to_upstream() {
     init_tracing();
     let (addr, _shutdown) = start_echo_headers_backend().await;

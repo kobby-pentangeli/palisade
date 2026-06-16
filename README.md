@@ -102,7 +102,10 @@ pool:
   max_idle_per_host: 32
 
 max_concurrent_requests: 1000
-max_body_size: 10485760  # 10 MiB
+max_connections: 10000          # simultaneously open client connections
+header_read_timeout: 10         # seconds to read full request headers
+max_body_size: 10485760         # 10 MiB, enforced on actual bytes
+mask_max_body_size: 1048576     # 1 MiB; larger responses stream unmasked
 
 blocked_headers:
   - X-Debug-Token

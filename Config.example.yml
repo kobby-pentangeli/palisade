@@ -13,6 +13,7 @@ masked_params:
   - ssn
   - credit_card
 max_body_size: 10485760
+mask_max_body_size: 1048576
 strip_response_headers:
   - server
   - x-powered-by
@@ -23,6 +24,8 @@ pool:
   idle_timeout: 60
   max_idle_per_host: 32
 max_concurrent_requests: 1000
+max_connections: 10000
+header_read_timeout: 10
 rate_limit:
   requests_per_second: 100
   burst: 50

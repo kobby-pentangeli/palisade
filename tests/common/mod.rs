@@ -102,6 +102,21 @@ pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeC
     )
 }
 
+/// Builds a `RuntimeConfig` that masks `password` but only buffers responses
+/// up to `ceiling` bytes for masking.
+pub fn test_config_with_mask_ceiling(addr: SocketAddr, ceiling: u64) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstreams: single_upstream(addr),
+            masked_params: vec!["password".into()],
+            mask_max_body_size: Some(ceiling),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
 /// Builds a `RuntimeConfig` with a short request timeout for testing.
 ///
 /// `timeout_ms` is accepted in milliseconds for test ergonomics but

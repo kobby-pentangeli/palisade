@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::HeaderName;
 use hyper::{Method, Request, Response, Uri};
@@ -80,8 +80,10 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///    receive a 429 Too Many Requests response with a `Retry-After` header.
 /// 2. **Request smuggling defense** — Rejects requests carrying both
 ///    `Content-Length` and `Transfer-Encoding` headers (RFC 7230 §3.3.3).
-/// 3. **Body size enforcement** — Rejects requests whose `Content-Length`
-///    exceeds the configured `max_body_size` with 413 Payload Too Large.
+/// 3. **Body size enforcement** — Rejects requests whose declared
+///    `Content-Length` exceeds `max_body_size` up front, and wraps the
+///    forwarded body in a length limit so an oversized or chunked body is
+///    rejected on actual byte count mid-stream with 413 Payload Too Large.
 /// 4. **GET inspection** — If the request method is GET, blocked headers and
 ///    query parameters are checked. Requests matching any block rule receive
 ///    a 403 Forbidden response.
@@ -103,8 +105,10 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///     removed from the upstream response.
 /// 13. **Response header stripping** — Configured internal headers (e.g.
 ///     `Server`, `X-Powered-By`) are removed from the response.
-/// 14. **Response masking** — For text-based upstream responses, sensitive
-///     parameter values are masked before returning to the client.
+/// 14. **Response masking** — For text-based upstream responses within the
+///     configured masking ceiling, sensitive parameter values are masked
+///     before returning to the client; larger or unbounded responses stream
+///     through unmasked rather than being buffered.
 /// 15. **Request ID injection** — An `X-Request-Id` header carrying the
 ///     monotonic request ID is added to every response for client-side
 ///     log correlation.
@@ -200,8 +204,8 @@ where
 
         let start = std::time::Instant::now();
         let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let boxed_body = body.map_err(|e| e.into()).boxed();
-        let proxy_req = Request::from_parts(parts, boxed_body);
+        let body_limit = usize::try_from(config.max_body_size).unwrap_or(usize::MAX);
+        let proxy_req = Request::from_parts(parts, Limited::new(body, body_limit).boxed());
 
         let upstream_result = timeout(config.request_timeout, client.request(proxy_req)).await;
 
@@ -211,6 +215,16 @@ where
                 resp
             }
             Ok(Err(e)) => {
+                if is_length_limit_error(&e) {
+                    warn!(
+                        limit = config.max_body_size,
+                        upstream = %upstream_uri_target,
+                        "request body exceeded size limit mid-stream"
+                    );
+                    return Err(ProxyError::BodyTooLarge {
+                        limit: config.max_body_size,
+                    });
+                }
                 let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     error = %e,
@@ -311,30 +325,46 @@ fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri> {
         .map_err(|e| ProxyError::Internal(format!("failed to build upstream URI: {e}")))
 }
 
+/// Returns `true` if any error in the chain is a body length-limit overflow,
+/// signalling that the forwarded request body exceeded `max_body_size`.
+fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |e| e.source()).any(|e| e.is::<LengthLimitError>())
+}
+
 /// Builds the client-facing response from the upstream response.
 ///
-/// For responses whose `Content-Type` indicates text or form-encoded data,
-/// the body is collected and scanned for sensitive parameter values. All
-/// other responses are streamed through unmodified.
+/// A response is buffered and scanned for sensitive parameter values only
+/// when masking is configured, its `Content-Type` indicates text or
+/// form-encoded data, and its declared `Content-Length` is within the
+/// configured masking ceiling. Every other response---no masking rules,
+/// non-text content, or a body that is unbounded or larger than the
+/// ceiling---is streamed through unmodified so the proxy never buffers an
+/// upstream body unboundedly. The collect is additionally bounded by the
+/// ceiling to guard against an upstream that understates its length.
 async fn build_response(
     upstream_resp: Response<Incoming>,
     config: &RuntimeConfig,
 ) -> Result<Response<BoxBody>> {
-    if config.mask_rules.is_empty() {
-        let (parts, body) = upstream_resp.into_parts();
-        return Ok(Response::from_parts(
-            parts,
-            body.map_err(|e| -> StdError { Box::new(e) }).boxed(),
-        ));
-    }
-
-    let should_mask = upstream_resp
+    let maskable_content_type = upstream_resp
         .headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .is_some_and(|ct| ct.contains("text/") || ct.contains("application/x-www-form-urlencoded"));
 
-    if !should_mask {
+    let within_ceiling = upstream_resp
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|len| len <= config.mask_max_body_size);
+
+    if config.mask_rules.is_empty() || !maskable_content_type || !within_ceiling {
+        if !config.mask_rules.is_empty() && maskable_content_type && !within_ceiling {
+            debug!(
+                ceiling = config.mask_max_body_size,
+                "maskable response has no declared length or exceeds masking ceiling; streaming unmasked"
+            );
+        }
         let (parts, body) = upstream_resp.into_parts();
         return Ok(Response::from_parts(
             parts,
@@ -343,23 +373,31 @@ async fn build_response(
     }
 
     let (parts, body) = upstream_resp.into_parts();
-    let body_bytes = body
+    let ceiling = usize::try_from(config.mask_max_body_size).unwrap_or(usize::MAX);
+    let body_bytes = Limited::new(body, ceiling)
         .collect()
         .await
-        .map_err(|e| ProxyError::Internal(format!("failed to read upstream body: {e}")))?
+        .map_err(|e| {
+            ProxyError::Internal(format!("failed to read upstream body for masking: {e}"))
+        })?
         .to_bytes();
 
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let masked = config.mask_sensitive_data(&body_str);
+    let masked = Bytes::from(config.mask_sensitive_data(&body_str));
+    let masked_len = masked.len();
 
     let mut response = Response::new(
-        Full::new(Bytes::from(masked))
+        Full::new(masked)
             .map_err(|never| -> StdError { match never {} })
             .boxed(),
     );
     *response.status_mut() = parts.status;
     *response.headers_mut() = parts.headers;
     *response.version_mut() = parts.version;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from(masked_len),
+    );
 
     Ok(response)
 }

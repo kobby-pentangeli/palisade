@@ -19,6 +19,10 @@ use crate::{ProxyError, Result};
 /// Default maximum request body size: 10 MiB.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Default ceiling on the response body the proxy will buffer for masking:
+/// 1 MiB. Larger responses stream through unmasked to bound memory use.
+pub const DEFAULT_MASK_MAX_BODY_SIZE: u64 = 1024 * 1024;
+
 /// Default connect timeout for establishing upstream TCP connections.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -34,6 +38,13 @@ pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
 /// Default maximum number of concurrent in-flight requests the proxy
 /// will handle before returning 503 Service Unavailable.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
+
+/// Default maximum number of simultaneously open client connections.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// Default maximum time the proxy waits for a client to send a complete set
+/// of request headers before closing the connection.
+pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default weight assigned to upstream backends when none is specified.
 pub const DEFAULT_UPSTREAM_WEIGHT: u32 = 1;
@@ -91,9 +102,14 @@ pub struct Config {
     #[serde(default)]
     pub masked_params: Vec<String>,
     /// Maximum allowed request body size in bytes (default: 10 MiB).
-    /// Requests with a `Content-Length` exceeding this limit receive 413.
+    /// Enforced on the actual byte count regardless of framing; an
+    /// overflowing request receives 413.
     #[serde(default)]
     pub max_body_size: Option<u64>,
+    /// Maximum response body size in bytes the proxy buffers for masking
+    /// (default: 1 MiB). Responses larger than this stream through unmasked.
+    #[serde(default)]
+    pub mask_max_body_size: Option<u64>,
     /// Response header names to strip before returning to the client.
     /// Typically `["server", "x-powered-by"]` to hide backend details.
     #[serde(default)]
@@ -102,6 +118,14 @@ pub struct Config {
     /// Service Unavailable (default: 1000).
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+    /// Maximum number of simultaneously open client connections
+    /// (default: 10000). Connections beyond this are dropped at accept time.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Maximum seconds to wait for a client to send complete request headers
+    /// before closing the connection (default: 10).
+    #[serde(default)]
+    pub header_read_timeout: Option<u64>,
     /// Timeout configuration for upstream connections and requests.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
@@ -341,9 +365,12 @@ pub struct RuntimeConfig {
     pub blocked_params: Vec<String>,
     /// Pre-compiled masking rules for response body inspection.
     pub mask_rules: Vec<MaskRule>,
-    /// Maximum request body size in bytes. Requests whose `Content-Length`
-    /// exceeds this threshold are rejected with 413 Payload Too Large.
+    /// Maximum request body size in bytes, enforced on the actual byte count.
+    /// Requests whose body exceeds this threshold are rejected with 413.
     pub max_body_size: u64,
+    /// Maximum response body size in bytes the proxy buffers for masking.
+    /// Responses larger than this are streamed through unmasked.
+    pub mask_max_body_size: u64,
     /// Lowercased response header names to strip before returning to the
     /// client (e.g. `"server"`, `"x-powered-by"`).
     pub strip_response_headers: Vec<String>,
@@ -357,6 +384,11 @@ pub struct RuntimeConfig {
     pub pool_max_idle_per_host: usize,
     /// Maximum concurrent in-flight requests. Overflow yields 503.
     pub max_concurrent_requests: usize,
+    /// Maximum number of simultaneously open client connections. New
+    /// connections beyond this ceiling are dropped at accept time.
+    pub max_connections: usize,
+    /// Maximum time to wait for a client to send complete request headers.
+    pub header_read_timeout: Duration,
     /// TLS termination configuration. `None` means plain HTTP.
     pub tls: Option<TlsConfig>,
     /// Active health check configuration. `None` disables active probing.
@@ -486,6 +518,15 @@ impl Config {
 
         let max_body_size = self.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE);
 
+        let mask_max_body_size = self
+            .mask_max_body_size
+            .unwrap_or(DEFAULT_MASK_MAX_BODY_SIZE);
+        if mask_max_body_size == 0 {
+            return Err(ProxyError::Config(
+                "mask_max_body_size must be positive".into(),
+            ));
+        }
+
         let strip_response_headers = self
             .strip_response_headers
             .into_iter()
@@ -503,6 +544,22 @@ impl Config {
         if max_concurrent_requests == 0 {
             return Err(ProxyError::Config(
                 "max_concurrent_requests must be positive".into(),
+            ));
+        }
+
+        let max_connections = self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        if max_connections == 0 {
+            return Err(ProxyError::Config(
+                "max_connections must be positive".into(),
+            ));
+        }
+
+        let header_read_timeout = self
+            .header_read_timeout
+            .map_or(DEFAULT_HEADER_READ_TIMEOUT, Duration::from_secs);
+        if header_read_timeout.is_zero() {
+            return Err(ProxyError::Config(
+                "header_read_timeout must be positive".into(),
             ));
         }
 
@@ -566,12 +623,15 @@ impl Config {
             blocked_params: self.blocked_params,
             mask_rules,
             max_body_size,
+            mask_max_body_size,
             strip_response_headers,
             connect_timeout,
             request_timeout,
             pool_idle_timeout,
             pool_max_idle_per_host,
             max_concurrent_requests,
+            max_connections,
+            header_read_timeout,
             tls: self.tls,
             health_check: self.health_check,
             failure_threshold,
@@ -714,6 +774,48 @@ mod tests {
             ..Default::default()
         };
         assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_max_connections() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            max_connections: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_header_read_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            header_read_timeout: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_mask_max_body_size() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            mask_max_body_size: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_applies_resource_limit_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(rt.header_read_timeout, DEFAULT_HEADER_READ_TIMEOUT);
+        assert_eq!(rt.mask_max_body_size, DEFAULT_MASK_MAX_BODY_SIZE);
     }
 
     #[test]
