@@ -80,7 +80,7 @@ async fn main() {
     });
 
     let upstream_is_https = config.has_https_upstream();
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let rate_limiter = config.rate_limit.as_ref().map(|rl_cfg| {
@@ -133,14 +133,17 @@ async fn main() {
     info!(%addr, "listening");
 
     let health_check_handle = config.health_check.as_ref().map(|hc| {
+        let probe_client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(palisade::tls::build_https_connector(config.connect_timeout));
         spawn_health_checker(
             balancer.clone(),
+            probe_client,
             Duration::from_secs(hc.interval),
             &hc.path,
             config.failure_threshold,
             config.healthy_threshold,
             Duration::from_secs(hc.timeout),
-            config.connect_timeout,
         )
     });
 

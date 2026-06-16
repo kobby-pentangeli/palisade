@@ -365,6 +365,11 @@ pub struct RuntimeConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking a backend healthy.
     pub healthy_threshold: u32,
+    /// Cooldown an ejected backend must wait before it becomes eligible for
+    /// a half-open trial request. Bounds in-flight trial traffic to roughly
+    /// one request per window and lets passive-only deployments recover
+    /// backends without active health checks.
+    pub health_check_cooldown: Duration,
     /// Per-IP rate limiting configuration. `None` disables rate limiting.
     pub rate_limit: Option<RateLimitConfig>,
     /// Graceful shutdown drain timeout. After signal receipt, in-flight
@@ -543,6 +548,13 @@ impl Config {
             .as_ref()
             .map_or(DEFAULT_HEALTHY_THRESHOLD, |hc| hc.healthy_threshold);
 
+        let health_check_cooldown = self
+            .health_check
+            .as_ref()
+            .map_or(DEFAULT_HEALTH_CHECK_COOLDOWN, |hc| {
+                Duration::from_secs(hc.cooldown)
+            });
+
         let shutdown_timeout = self
             .shutdown_timeout
             .map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_secs);
@@ -564,6 +576,7 @@ impl Config {
             health_check: self.health_check,
             failure_threshold,
             healthy_threshold,
+            health_check_cooldown,
             rate_limit: self.rate_limit,
             shutdown_timeout,
         })
@@ -923,6 +936,7 @@ mod tests {
         let rt = config.into_runtime().unwrap();
         assert_eq!(rt.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
         assert_eq!(rt.healthy_threshold, DEFAULT_HEALTHY_THRESHOLD);
+        assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
         assert!(rt.health_check.is_some());
         let hc = rt.health_check.as_ref().unwrap();
         assert_eq!(hc.cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN.as_secs());

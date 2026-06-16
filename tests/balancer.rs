@@ -41,7 +41,7 @@ async fn requests_distributed_across_multiple_backends() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let mut bodies = Vec::new();
@@ -104,7 +104,7 @@ async fn weighted_distribution_sends_more_to_heavier_backend() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let mut heavy_count = 0u32;
@@ -170,7 +170,7 @@ async fn unhealthy_backend_is_skipped() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     // Pre-mark the bad backend as unhealthy so all requests hit the good one.
@@ -221,7 +221,7 @@ async fn all_backends_unhealthy_returns_503() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     balancer.pool().all()[0].mark_unhealthy();
@@ -265,7 +265,7 @@ async fn recovered_backend_receives_traffic_again() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     // Mark backend-1 unhealthy.
@@ -341,7 +341,7 @@ async fn single_upstream_routes_all_traffic() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let req = Request::builder()

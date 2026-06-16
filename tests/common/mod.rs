@@ -127,7 +127,7 @@ pub fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<Runtim
 
 /// Builds a [`LoadBalancer`] backed by the upstream(s) in the given config.
 pub fn test_balancer(config: &RuntimeConfig) -> LoadBalancer {
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     LoadBalancer::new(pool)
 }
 
@@ -407,6 +407,41 @@ pub async fn start_tls_backend(
 
 /// Builds an HTTPS client that trusts the given self-signed certificate.
 pub fn test_https_client(cert_pem: &str) -> palisade::HttpsClient {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &cert_der {
+        root_store.add(cert.clone()).unwrap();
+    }
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
+/// Builds an HTTPS probe client (empty request body) that trusts the given
+/// self-signed certificate, for exercising the active health checker against
+/// a TLS backend.
+pub fn test_https_probe_client(
+    cert_pem: &str,
+) -> Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Empty<Bytes>,
+> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
 

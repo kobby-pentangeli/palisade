@@ -209,28 +209,19 @@ pub async fn serve<C>(
 /// Spawns a background task that periodically probes each upstream backend
 /// at the configured health check path, updating health state based on
 /// HTTP response status.
-///
-/// The `timeout` parameter bounds each individual probe request, and
-/// `connect_timeout` bounds the TCP connect phase of each probe. Backends
-/// that accumulate `failure_threshold` consecutive failures are marked
-/// unhealthy. Unhealthy backends that accumulate `healthy_threshold`
-/// consecutive successes are promoted back to healthy.
-pub fn spawn_health_checker(
+pub fn spawn_health_checker<C>(
     balancer: LoadBalancer,
+    client: hyper_util::client::legacy::Client<C, http_body_util::Empty<bytes::Bytes>>,
     interval: Duration,
     path: &str,
     failure_threshold: u32,
     healthy_threshold: u32,
     timeout: Duration,
-    connect_timeout: Duration,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
     let path = path.to_owned();
-    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-    connector.set_connect_timeout(Some(connect_timeout));
-
-    let client: hyper_util::client::legacy::Client<_, http_body_util::Empty<bytes::Bytes>> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(connector);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);

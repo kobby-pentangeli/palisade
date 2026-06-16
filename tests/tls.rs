@@ -8,6 +8,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
@@ -18,7 +19,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use palisade::{Config, TlsConfig, UpstreamConfig, handle_request};
+use palisade::server::spawn_health_checker;
+use palisade::{Config, LoadBalancer, TlsConfig, UpstreamConfig, UpstreamPool, handle_request};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -61,6 +63,59 @@ async fn tls_origination_forwards_to_https_upstream() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("tls-hello"));
+}
+
+#[tokio::test]
+async fn https_health_check_probes_tls_backend() {
+    init_tracing();
+    let (cert_pem, key_pem) = generate_test_cert();
+    let (addr, _shutdown) =
+        start_tls_backend(&cert_pem, &key_pem, StatusCode::OK, "text/plain", "ok").await;
+
+    let config = Arc::new(
+        Config {
+            upstreams: vec![UpstreamConfig {
+                address: format!("https://localhost:{}", addr.port()),
+                weight: 1,
+            }],
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config"),
+    );
+
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
+    let balancer = LoadBalancer::new(pool);
+
+    // Eject the backend so a successful probe must transition it back.
+    balancer.pool().all()[0].mark_unhealthy();
+    assert!(!balancer.pool().all()[0].is_healthy());
+
+    let probe_client = test_https_probe_client(&cert_pem);
+    let handle = spawn_health_checker(
+        balancer.clone(),
+        probe_client,
+        Duration::from_millis(50),
+        "/health",
+        3,
+        1,
+        Duration::from_secs(2),
+    );
+
+    let mut recovered = false;
+    for _ in 0..40 {
+        if balancer.pool().all()[0].is_healthy() {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    handle.abort();
+
+    assert!(
+        recovered,
+        "HTTPS health check should probe the TLS backend over TLS and recover it"
+    );
 }
 
 #[tokio::test]

@@ -33,7 +33,7 @@
 //!         .expect("valid configuration");
 //!
 //!     let client = build_client(&config);
-//!     let pool = UpstreamPool::from_validated(&config.upstreams);
+//!     let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
 //!     let balancer = LoadBalancer::new(pool);
 //!     let config = Arc::new(config);
 //!
