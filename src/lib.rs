@@ -2,7 +2,7 @@
 //!
 //! This crate provides the core proxy logic: configuration loading with
 //! pre-compiled regex patterns, request forwarding with body streaming,
-//! header and parameter blocking for GET requests, sensitive data
+//! header and parameter blocking across all methods, sensitive data
 //! masking in response bodies, weighted round-robin load balancing with
 //! passive and active health checks, structured observability via [tracing],
 //! configurable timeouts, connection pool tuning, concurrency limiting,
@@ -48,6 +48,7 @@
 //!         config,
 //!         balancer,
 //!         SocketAddr::from(([127, 0, 0, 1], 0)),
+//!         false,
 //!         None,
 //!     )
 //!     .await

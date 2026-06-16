@@ -44,6 +44,7 @@ async fn requests_within_limit_succeed() {
             config.clone(),
             test_balancer(&config),
             test_addr(),
+            false,
             Some(&limiter),
         )
         .await
@@ -77,6 +78,7 @@ async fn requests_exceeding_burst_returns_429() {
             config.clone(),
             test_balancer(&config),
             test_addr(),
+            false,
             Some(&limiter),
         )
         .await
@@ -97,6 +99,7 @@ async fn requests_exceeding_burst_returns_429() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         Some(&limiter),
     )
     .await
@@ -136,6 +139,7 @@ async fn rate_limit_is_per_ip() {
         config.clone(),
         test_balancer(&config),
         addr_a,
+        false,
         Some(&limiter),
     )
     .await
@@ -154,6 +158,7 @@ async fn rate_limit_is_per_ip() {
         config.clone(),
         test_balancer(&config),
         addr_a,
+        false,
         Some(&limiter),
     )
     .await
@@ -172,6 +177,7 @@ async fn rate_limit_is_per_ip() {
         config.clone(),
         test_balancer(&config),
         addr_b,
+        false,
         Some(&limiter),
     )
     .await
@@ -198,6 +204,7 @@ async fn no_rate_limiter_passes_all_requests() {
             config.clone(),
             test_balancer(&config),
             test_addr(),
+            false,
             None,
         )
         .await
@@ -229,6 +236,7 @@ async fn rate_limit_recovery_after_wait() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         Some(&limiter),
     )
     .await
@@ -247,6 +255,7 @@ async fn rate_limit_recovery_after_wait() {
             config.clone(),
             test_balancer(&config),
             test_addr(),
+            false,
             Some(&limiter),
         )
         .await
@@ -268,6 +277,7 @@ async fn rate_limit_recovery_after_wait() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         Some(&limiter),
     )
     .await

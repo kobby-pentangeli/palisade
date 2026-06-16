@@ -17,6 +17,7 @@ mask_max_body_size: 1048576
 strip_response_headers:
   - server
   - x-powered-by
+trust_forwarded_headers: false
 timeouts:
   connect: 5
   request: 30

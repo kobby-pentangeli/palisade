@@ -33,6 +33,7 @@ async fn get_request_forwards_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -43,7 +44,7 @@ async fn get_request_forwards_to_upstream() {
 }
 
 #[tokio::test]
-async fn post_request_forwards_without_inspection() {
+async fn post_request_forwards_to_upstream() {
     init_tracing();
     let (addr, _shutdown) =
         start_backend(StatusCode::CREATED, "application/json", r#"{"id":1}"#).await;
@@ -52,7 +53,6 @@ async fn post_request_forwards_without_inspection() {
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://{addr}/resource"))
-        .header("x-blocked", "should-not-matter-for-post")
         .body(Full::new(Bytes::from(r#"{"name":"test"}"#)))
         .unwrap();
 
@@ -62,6 +62,7 @@ async fn post_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -70,7 +71,62 @@ async fn post_request_forwards_without_inspection() {
 }
 
 #[tokio::test]
-async fn put_request_forwards_without_inspection() {
+async fn post_with_blocked_header_returns_403() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "should not reach").await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{addr}/resource"))
+        .header("x-blocked", "present")
+        .body(Full::new(Bytes::from(r#"{"name":"test"}"#)))
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn post_with_blocked_param_returns_403() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "should not reach").await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{addr}/resource?secret_key=abc"))
+        .body(Full::new(Bytes::from("payload")))
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_request_forwards_to_upstream() {
     init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "updated").await;
     let config = test_config(addr);
@@ -87,6 +143,7 @@ async fn put_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -95,7 +152,7 @@ async fn put_request_forwards_without_inspection() {
 }
 
 #[tokio::test]
-async fn delete_request_forwards_without_inspection() {
+async fn delete_request_forwards_to_upstream() {
     init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::NO_CONTENT, "text/plain", "").await;
     let config = test_config(addr);
@@ -112,6 +169,7 @@ async fn delete_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -137,6 +195,7 @@ async fn upstream_preserves_status_code() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -163,6 +222,7 @@ async fn get_blocked_header_returns_403() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -189,12 +249,41 @@ async fn get_blocked_param_returns_403() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
     .unwrap_err()
     .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn blocked_param_substring_is_allowed() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+    let config = test_config(addr);
+
+    // `test_config` blocks `secret_key`; a parameter that merely contains it
+    // as a substring must not be treated as a match.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/?my_secret_key=abc"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -220,6 +309,7 @@ async fn response_body_masking_replaces_sensitive_params() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -255,6 +345,7 @@ async fn response_body_not_masked_for_json_content_type() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -290,6 +381,7 @@ async fn no_masking_when_mask_rules_empty() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -318,6 +410,7 @@ async fn smuggling_attempt_returns_400() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -345,6 +438,7 @@ async fn body_too_large_returns_413() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -372,6 +466,7 @@ async fn body_within_limit_succeeds() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -399,6 +494,7 @@ async fn oversized_body_without_content_length_returns_413() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -427,6 +523,7 @@ async fn response_above_masking_ceiling_streams_unmasked() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -454,6 +551,7 @@ async fn response_within_masking_ceiling_is_masked() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -482,6 +580,7 @@ async fn forwarding_headers_injected_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -504,6 +603,109 @@ async fn forwarding_headers_injected_to_upstream() {
 }
 
 #[tokio::test]
+async fn forwarded_proto_is_https_under_tls_termination() {
+    init_tracing();
+    let (addr, _shutdown) = start_echo_headers_backend().await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/test"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    // `client_tls = true` models an inbound connection terminated by the proxy.
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let body = collect_body(resp.into_body()).await;
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        body_str.contains("x-forwarded-proto: https"),
+        "expected https forwarded proto in: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn spoofed_forwarded_for_replaced_by_default() {
+    init_tracing();
+    let (addr, _shutdown) = start_echo_headers_backend().await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/test"))
+        .header("x-forwarded-for", "1.2.3.4")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let body = collect_body(resp.into_body()).await;
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        body_str.contains("x-forwarded-for: 192.168.1.100"),
+        "expected observed client address in: {body_str}"
+    );
+    assert!(
+        !body_str.contains("1.2.3.4"),
+        "spoofed forwarded-for must be discarded: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_for_appended_when_trusted() {
+    init_tracing();
+    let (addr, _shutdown) = start_echo_headers_backend().await;
+    let config = test_config_trusting_forwarded(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/test"))
+        .header("x-forwarded-for", "1.2.3.4")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let body = collect_body(resp.into_body()).await;
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        body_str.contains("x-forwarded-for: 1.2.3.4, 192.168.1.100"),
+        "expected appended forwarded-for chain in: {body_str}"
+    );
+}
+
+#[tokio::test]
 async fn host_header_rewritten_to_upstream() {
     init_tracing();
     let (addr, _shutdown) = start_echo_headers_backend().await;
@@ -522,6 +724,7 @@ async fn host_header_rewritten_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -557,6 +760,7 @@ async fn hop_by_hop_headers_stripped_from_request() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -600,6 +804,7 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -642,6 +847,7 @@ async fn request_timeout_returns_504() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -668,6 +874,7 @@ async fn request_within_timeout_succeeds() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -695,6 +902,7 @@ async fn response_includes_x_request_id() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -734,6 +942,7 @@ async fn x_request_id_increments_across_requests() {
             config.clone(),
             test_balancer(&config),
             test_addr(),
+            false,
             None,
         )
         .await

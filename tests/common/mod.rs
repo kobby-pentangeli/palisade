@@ -89,6 +89,20 @@ pub fn test_config_with_stripping(addr: SocketAddr) -> Arc<RuntimeConfig> {
     )
 }
 
+/// Builds a `RuntimeConfig` that trusts client-supplied `X-Forwarded-*`
+/// headers, modelling deployment behind another trusted proxy.
+pub fn test_config_trusting_forwarded(addr: SocketAddr) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstreams: single_upstream(addr),
+            trust_forwarded_headers: true,
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
 /// Builds a `RuntimeConfig` with a specific body size limit.
 pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeConfig> {
     Arc::new(

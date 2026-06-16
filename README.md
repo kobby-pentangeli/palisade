@@ -5,7 +5,7 @@
 [![CI](https://github.com/kobby-pentangeli/palisade/workflows/CI/badge.svg)](https://github.com/kobby-pentangeli/palisade/actions)
 [![License](https://img.shields.io/crates/l/palisade.svg)](https://github.com/kobby-pentangeli/palisade#license)
 
-An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio.rs/), and [rustls](https://docs.rs/rustls). Distributes traffic across weighted upstream backends with active and passive health checks, enforces request policies (header/parameter blocking, body size limits, sensitive data masking), and terminates TLS -- all with streaming I/O and zero per-request allocation for config lookups.
+An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio.rs/), and [rustls](https://docs.rs/rustls). Distributes traffic across weighted upstream backends with active and passive health checks, enforces request policies (header/parameter blocking, body size limits, sensitive data masking), and terminates TLS---all with streaming I/O and zero per-request allocation for config lookups.
 
 ## Features
 
@@ -123,6 +123,8 @@ masked_params:
 strip_response_headers:
   - server
   - x-powered-by
+
+trust_forwarded_headers: false  # replace X-Forwarded-For/Proto unless behind a trusted proxy
 
 health_check:
   path: /health

@@ -1,9 +1,9 @@
 //! HTTP header processing: hop-by-hop removal, forwarding header injection,
 //! host rewriting, and response header sanitization.
 //!
-//! Implements the header-level requirements of RFC 7230 Section 6.1
-//! (hop-by-hop header handling) and the de-facto `X-Forwarded-*` convention
-//! for reverse proxies.
+//! Implements the header-level requirements of RFC 9110 Section 7.6.1
+//! (connection-scoped header handling) and the de-facto `X-Forwarded-*`
+//! convention for reverse proxies.
 
 use std::net::SocketAddr;
 
@@ -12,10 +12,10 @@ use hyper::http::uri::Authority;
 
 /// Removes all hop-by-hop headers from the given header map.
 ///
-/// Strips the standard set defined in RFC 7230 Section 6.1 (`Connection`,
-/// `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`,
-/// `Trailers`, `Transfer-Encoding`, `Upgrade`), plus any additional
-/// header names declared in the `Connection` header value.
+/// Strips the standard set (`Connection`, `Keep-Alive`,
+/// `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailers`,
+/// `Transfer-Encoding`, `Upgrade`), plus any additional header names
+/// declared in the `Connection` header value, per RFC 9110 Section 7.6.1.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     let conn: Vec<HeaderName> = headers
         .get("connection")
@@ -50,23 +50,36 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// Injects `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`
 /// headers into the given header map.
 ///
-/// - `X-Forwarded-For` is appended to any existing value (preserving upstream
-///   proxy chains) with the client's socket address.
-/// - `X-Forwarded-Proto` is set to `"http"`.
-/// - `X-Forwarded-Host` is set to the original `Host` header value, if present.
-pub fn inject_forwarding_headers(headers: &mut HeaderMap, client_addr: SocketAddr) {
+/// `client_tls` reflects whether the inbound client connection was
+/// TLS-terminated by this proxy, and `trust_forwarded` selects how
+/// client-supplied forwarding metadata is treated.
+pub fn inject_forwarding_headers(
+    headers: &mut HeaderMap,
+    client_addr: SocketAddr,
+    client_tls: bool,
+    trust_forwarded: bool,
+) {
     let client_ip = client_addr.ip().to_string();
 
-    let xff_value = headers
-        .get("x-forwarded-for")
-        .and_then(|existing| existing.to_str().ok())
-        .map(|existing| format!("{existing}, {client_ip}"))
-        .unwrap_or_else(|| client_ip);
+    let xff_value = if trust_forwarded {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|existing| existing.to_str().ok())
+            .map(|existing| format!("{existing}, {client_ip}"))
+            .unwrap_or(client_ip)
+    } else {
+        client_ip
+    };
 
     if let Ok(val) = HeaderValue::from_str(&xff_value) {
         headers.insert("x-forwarded-for", val);
     }
-    headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+
+    if !(trust_forwarded && headers.contains_key("x-forwarded-proto")) {
+        let proto = if client_tls { "https" } else { "http" };
+        headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
+    }
+
     if let Some(host) = headers.get(hyper::header::HOST) {
         headers.insert("x-forwarded-host", host.clone());
     }
@@ -94,7 +107,7 @@ pub fn strip_response_headers(headers: &mut HeaderMap, names: &[String]) {
 
 /// Returns `true` if the request contains both `Content-Length` and
 /// `Transfer-Encoding` headers, which is a request smuggling indicator
-/// per RFC 7230 Section 3.3.3.
+/// per RFC 9112 Section 6.1.
 pub fn is_smuggling_attempt(headers: &HeaderMap) -> bool {
     headers.contains_key(hyper::header::CONTENT_LENGTH)
         && headers.contains_key(hyper::header::TRANSFER_ENCODING)
@@ -171,7 +184,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let addr = "192.168.1.10:5000".parse::<SocketAddr>().unwrap();
 
-        inject_forwarding_headers(&mut headers, addr);
+        inject_forwarding_headers(&mut headers, addr, false, false);
 
         assert_eq!(
             headers.get("x-forwarded-for").unwrap().to_str().unwrap(),
@@ -180,11 +193,24 @@ mod tests {
     }
 
     #[test]
-    fn appends_to_existing_xff() {
+    fn replaces_existing_xff_when_untrusted() {
         let mut headers = header_map(&[("x-forwarded-for", "10.0.0.1")]);
         let addr = "192.168.1.10:5000".parse::<SocketAddr>().unwrap();
 
-        inject_forwarding_headers(&mut headers, addr);
+        inject_forwarding_headers(&mut headers, addr, false, false);
+
+        assert_eq!(
+            headers.get("x-forwarded-for").unwrap().to_str().unwrap(),
+            "192.168.1.10"
+        );
+    }
+
+    #[test]
+    fn appends_to_existing_xff_when_trusted() {
+        let mut headers = header_map(&[("x-forwarded-for", "10.0.0.1")]);
+        let addr = "192.168.1.10:5000".parse::<SocketAddr>().unwrap();
+
+        inject_forwarding_headers(&mut headers, addr, false, true);
 
         assert_eq!(
             headers.get("x-forwarded-for").unwrap().to_str().unwrap(),
@@ -193,11 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn injects_forwarded_proto() {
+    fn injects_forwarded_proto_http() {
         let mut headers = HeaderMap::new();
         let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
 
-        inject_forwarding_headers(&mut headers, addr);
+        inject_forwarding_headers(&mut headers, addr, false, false);
 
         assert_eq!(
             headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
@@ -206,11 +232,50 @@ mod tests {
     }
 
     #[test]
+    fn injects_forwarded_proto_https_under_tls() {
+        let mut headers = HeaderMap::new();
+        let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
+
+        inject_forwarding_headers(&mut headers, addr, true, false);
+
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+    }
+
+    #[test]
+    fn overwrites_spoofed_forwarded_proto_when_untrusted() {
+        let mut headers = header_map(&[("x-forwarded-proto", "https")]);
+        let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
+
+        inject_forwarding_headers(&mut headers, addr, false, false);
+
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "http"
+        );
+    }
+
+    #[test]
+    fn preserves_forwarded_proto_when_trusted() {
+        let mut headers = header_map(&[("x-forwarded-proto", "https")]);
+        let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
+
+        inject_forwarding_headers(&mut headers, addr, false, true);
+
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+    }
+
+    #[test]
     fn injects_forwarded_host_from_original() {
         let mut headers = header_map(&[("host", "api.example.com")]);
         let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
 
-        inject_forwarding_headers(&mut headers, addr);
+        inject_forwarding_headers(&mut headers, addr, false, false);
 
         assert_eq!(
             headers.get("x-forwarded-host").unwrap().to_str().unwrap(),
@@ -223,7 +288,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let addr = "127.0.0.1:1234".parse::<SocketAddr>().unwrap();
 
-        inject_forwarding_headers(&mut headers, addr);
+        inject_forwarding_headers(&mut headers, addr, false, false);
 
         assert!(!headers.contains_key("x-forwarded-host"));
     }

@@ -66,6 +66,7 @@ pub async fn serve<C>(
     let shutdown_timeout = config.shutdown_timeout;
     let max_connections = config.max_connections;
     let header_read_timeout = config.header_read_timeout;
+    let client_tls = tls_acceptor.is_some();
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
 
@@ -145,6 +146,7 @@ pub async fn serve<C>(
                                 config,
                                 balancer,
                                 client_addr,
+                                client_tls,
                                 rate_limiter.as_ref(),
                             )
                             .await

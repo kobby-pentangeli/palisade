@@ -17,7 +17,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::HeaderName;
-use hyper::{Method, Request, Response, Uri};
+use hyper::{Request, Response, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -79,20 +79,25 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///    checked against the per-IP token bucket. Requests exceeding the limit
 ///    receive a 429 Too Many Requests response with a `Retry-After` header.
 /// 2. **Request smuggling defense** — Rejects requests carrying both
-///    `Content-Length` and `Transfer-Encoding` headers (RFC 7230 §3.3.3).
+///    `Content-Length` and `Transfer-Encoding` headers (RFC 9112 §6.1).
 /// 3. **Body size enforcement** — Rejects requests whose declared
 ///    `Content-Length` exceeds `max_body_size` up front, and wraps the
 ///    forwarded body in a length limit so an oversized or chunked body is
 ///    rejected on actual byte count mid-stream with 413 Payload Too Large.
-/// 4. **GET inspection** — If the request method is GET, blocked headers and
-///    query parameters are checked. Requests matching any block rule receive
-///    a 403 Forbidden response.
+/// 4. **Policy inspection** — On every method, blocked headers and query
+///    parameters are checked. The query string is parsed into decoded
+///    key/value pairs and matched by exact key, so a substring or
+///    percent-encoded parameter name cannot bypass a block rule. Requests
+///    matching any rule receive a 403 Forbidden response.
 /// 5. **Upstream selection** — The round-robin balancer selects the next
 ///    healthy backend. If none are available, returns 503.
 /// 6. **Hop-by-hop stripping** — Connection-scoped headers are removed
-///    before forwarding, per RFC 7230 §6.1.
+///    before forwarding, per RFC 9110 §7.6.1.
 /// 7. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
 ///    `X-Forwarded-Host` are injected to preserve client origin metadata.
+///    `X-Forwarded-Proto` reflects the actual inbound scheme; unless
+///    `trust_forwarded_headers` is enabled, `X-Forwarded-For` is replaced
+///    with the observed client address rather than trusting client input.
 /// 8. **Host rewriting** — The `Host` header is set to the upstream authority.
 /// 9. **URI rewriting** — The request URI is rewritten to target the selected
 ///    upstream, preserving the original path and query string.
@@ -118,6 +123,7 @@ pub async fn handle_request<B, C>(
     config: Arc<RuntimeConfig>,
     balancer: LoadBalancer,
     client_addr: SocketAddr,
+    client_tls: bool,
     rate_limiter: Option<&IpRateLimiter>,
 ) -> Result<Response<BoxBody>>
 where
@@ -170,9 +176,7 @@ where
             });
         }
 
-        if method == Method::GET {
-            inspect_get_request(&req, &config)?;
-        }
+        inspect_request(&req, &config)?;
 
         let upstream = balancer.next()?;
         let upstream_uri_target = upstream.uri();
@@ -182,7 +186,12 @@ where
         let (mut parts, body) = req.into_parts();
 
         headers::strip_hop_by_hop(&mut parts.headers);
-        headers::inject_forwarding_headers(&mut parts.headers, client_addr);
+        headers::inject_forwarding_headers(
+            &mut parts.headers,
+            client_addr,
+            client_tls,
+            config.trust_forwarded_headers,
+        );
         headers::rewrite_host(
             &mut parts.headers,
             upstream_uri_target
@@ -275,11 +284,16 @@ where
     .await
 }
 
-/// Checks a GET request against configured block rules.
+/// Checks a request against configured block rules, regardless of method.
+///
+/// Blocked headers are matched by name. Blocked query parameters are matched
+/// against the decoded query string by exact key, so neither a substring
+/// (`secret_key` does not match `my_secret_key`) nor a percent-encoded name
+/// can slip past a rule.
 ///
 /// Returns `ProxyError::BlockedHeader` or `ProxyError::BlockedParam`
 /// if any rule matches, allowing the caller to short-circuit with a 403.
-fn inspect_get_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()> {
+fn inspect_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()> {
     let headers = req.headers();
     config
         .blocked_headers
@@ -291,13 +305,16 @@ fn inspect_get_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()
         })?;
 
     let query = req.uri().query().unwrap_or_default();
-    config
-        .blocked_params
-        .iter()
-        .find(|param| query.contains(&format!("{param}=")))
-        .map_or(Ok(()), |name| {
-            warn!(param = %name, "blocked parameter detected");
-            Err(ProxyError::BlockedParam(name.clone()))
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| {
+            config
+                .blocked_params
+                .iter()
+                .any(|param| param.as_str() == key.as_ref())
+        })
+        .map_or(Ok(()), |(key, _)| {
+            warn!(param = %key, "blocked parameter detected");
+            Err(ProxyError::BlockedParam(key.into_owned()))
         })
 }
 
@@ -405,6 +422,7 @@ async fn build_response(
 #[cfg(test)]
 mod tests {
     use http_body_util::Empty;
+    use hyper::Method;
 
     use super::*;
     use crate::Config;
@@ -442,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_get_detects_blocked_header() {
+    fn inspect_detects_blocked_header() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
@@ -458,12 +476,12 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = inspect_get_request(&req, &config);
+        let result = inspect_request(&req, &config);
         assert!(result.is_err());
     }
 
     #[test]
-    fn inspect_get_detects_blocked_param() {
+    fn inspect_detects_blocked_param() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_params: vec!["secret_key".into()],
@@ -478,12 +496,70 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = inspect_get_request(&req, &config);
+        let result = inspect_request(&req, &config);
         assert!(result.is_err());
     }
 
     #[test]
-    fn inspect_get_allows_clean_request() {
+    fn inspect_enforces_blocked_header_on_non_get() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_headers: vec!["x-bad-header".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/resource")
+            .header("x-bad-header", "anything")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_err());
+    }
+
+    #[test]
+    fn inspect_blocked_param_requires_exact_key() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_params: vec!["secret_key".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/?my_secret_key=abc123")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_ok());
+    }
+
+    #[test]
+    fn inspect_blocked_param_matches_percent_encoded_key() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_params: vec!["secret key".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/?secret%20key=abc123")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_err());
+    }
+
+    #[test]
+    fn inspect_allows_clean_request() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
@@ -500,6 +576,6 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        assert!(inspect_get_request(&req, &config).is_ok());
+        assert!(inspect_request(&req, &config).is_ok());
     }
 }

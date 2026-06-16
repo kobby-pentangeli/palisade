@@ -114,6 +114,10 @@ pub struct Config {
     /// Typically `["server", "x-powered-by"]` to hide backend details.
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
+    /// Whether to trust client-supplied `X-Forwarded-*` headers
+    /// (default: `false`).
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
     /// Maximum concurrent in-flight requests before returning 503
     /// Service Unavailable (default: 1000).
     #[serde(default)]
@@ -374,6 +378,9 @@ pub struct RuntimeConfig {
     /// Lowercased response header names to strip before returning to the
     /// client (e.g. `"server"`, `"x-powered-by"`).
     pub strip_response_headers: Vec<String>,
+    /// Whether client-supplied `X-Forwarded-*` headers are trusted
+    /// (default: `false`).
+    pub trust_forwarded_headers: bool,
     /// Connect timeout for upstream TCP connections.
     pub connect_timeout: Duration,
     /// Total request timeout for the upstream round-trip. Expiry yields 504.
@@ -625,6 +632,7 @@ impl Config {
             max_body_size,
             mask_max_body_size,
             strip_response_headers,
+            trust_forwarded_headers: self.trust_forwarded_headers,
             connect_timeout,
             request_timeout,
             pool_idle_timeout,
@@ -816,6 +824,27 @@ mod tests {
         assert_eq!(rt.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(rt.header_read_timeout, DEFAULT_HEADER_READ_TIMEOUT);
         assert_eq!(rt.mask_max_body_size, DEFAULT_MASK_MAX_BODY_SIZE);
+    }
+
+    #[test]
+    fn into_runtime_defaults_to_untrusted_forwarded_headers() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert!(!rt.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn into_runtime_propagates_trust_forwarded_headers() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert!(rt.trust_forwarded_headers);
     }
 
     #[test]
