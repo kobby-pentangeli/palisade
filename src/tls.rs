@@ -10,8 +10,10 @@
 //!   upstream backends using the platform root certificate store.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
@@ -41,8 +43,12 @@ pub fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 /// Uses the Mozilla root certificate store via [`webpki_roots`] for server
 /// verification. The resulting connector supports both `http://` and
 /// `https://` schemes; plain HTTP connections pass through unmodified.
-pub fn build_https_connector()
--> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
+///
+/// `connect_timeout` bounds the TCP connect phase of every upstream
+/// connection the resulting connector establishes.
+pub fn build_https_connector(
+    connect_timeout: Duration,
+) -> hyper_rustls::HttpsConnector<HttpConnector> {
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -50,11 +56,15 @@ pub fn build_https_connector()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
+    let mut http = HttpConnector::new();
+    http.set_connect_timeout(Some(connect_timeout));
+    http.enforce_http(false);
+
     HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
-        .build()
+        .wrap_connector(http)
 }
 
 /// Loads PEM-encoded X.509 certificates from the file at `path`.

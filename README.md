@@ -96,10 +96,9 @@ upstreams:
 timeouts:
   connect: 5       # seconds
   request: 30      # seconds
-  idle: 60         # seconds
 
 pool:
-  idle_timeout: 60       # seconds
+  idle_timeout: 60       # seconds  (idle timeout for pooled upstream connections)
   max_idle_per_host: 32
 
 max_concurrent_requests: 1000

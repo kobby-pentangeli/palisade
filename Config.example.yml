@@ -19,7 +19,6 @@ strip_response_headers:
 timeouts:
   connect: 5
   request: 30
-  idle: 60
 pool:
   idle_timeout: 60
   max_idle_per_host: 32

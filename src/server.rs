@@ -210,7 +210,8 @@ pub async fn serve<C>(
 /// at the configured health check path, updating health state based on
 /// HTTP response status.
 ///
-/// The `timeout` parameter bounds each individual probe request. Backends
+/// The `timeout` parameter bounds each individual probe request, and
+/// `connect_timeout` bounds the TCP connect phase of each probe. Backends
 /// that accumulate `failure_threshold` consecutive failures are marked
 /// unhealthy. Unhealthy backends that accumulate `healthy_threshold`
 /// consecutive successes are promoted back to healthy.
@@ -221,9 +222,11 @@ pub fn spawn_health_checker(
     failure_threshold: u32,
     healthy_threshold: u32,
     timeout: Duration,
+    connect_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let path = path.to_owned();
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.set_connect_timeout(Some(connect_timeout));
 
     let client: hyper_util::client::legacy::Client<_, http_body_util::Empty<bytes::Bytes>> =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())

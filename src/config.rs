@@ -5,10 +5,12 @@
 //! and stored alongside the raw config for zero-allocation lookups at
 //! request time.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use hyper::header::HeaderName;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -137,10 +139,6 @@ pub struct TimeoutsConfig {
     /// (default: 30). Requests exceeding this receive 504.
     #[serde(default = "default_request_timeout_secs")]
     pub request: u64,
-    /// Idle timeout in seconds for pooled upstream connections
-    /// (default: 60).
-    #[serde(default = "default_idle_timeout_secs")]
-    pub idle: u64,
 }
 
 fn default_connect_timeout_secs() -> u64 {
@@ -151,16 +149,11 @@ fn default_request_timeout_secs() -> u64 {
     DEFAULT_REQUEST_TIMEOUT.as_secs()
 }
 
-fn default_idle_timeout_secs() -> u64 {
-    DEFAULT_POOL_IDLE_TIMEOUT.as_secs()
-}
-
 impl Default for TimeoutsConfig {
     fn default() -> Self {
         Self {
             connect: default_connect_timeout_secs(),
             request: default_request_timeout_secs(),
-            idle: default_idle_timeout_secs(),
         }
     }
 }
@@ -342,8 +335,8 @@ pub struct RuntimeConfig {
     pub listen: SocketAddr,
     /// Validated upstream backends with their load-balancing weights.
     pub upstreams: Vec<ValidatedUpstream>,
-    /// Lowercased header names whose presence triggers a 403 on GET requests.
-    pub blocked_headers: Vec<String>,
+    /// Pre-parsed header names whose presence triggers a 403 on GET requests.
+    pub blocked_headers: Vec<HeaderName>,
     /// Query parameter names whose presence triggers a 403 on GET requests.
     pub blocked_params: Vec<String>,
     /// Pre-compiled masking rules for response body inspection.
@@ -372,8 +365,6 @@ pub struct RuntimeConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking a backend healthy.
     pub healthy_threshold: u32,
-    /// Cooldown period before re-checking an unhealthy backend.
-    pub health_check_cooldown: Duration,
     /// Per-IP rate limiting configuration. `None` disables rate limiting.
     pub rate_limit: Option<RateLimitConfig>,
     /// Graceful shutdown drain timeout. After signal receipt, in-flight
@@ -454,11 +445,23 @@ impl Config {
             .map(|u| validate_upstream(&u.address, u.weight))
             .collect::<Result<Vec<_>>>()?;
 
+        let mut seen = HashSet::with_capacity(upstreams.len());
+        if let Some(dup) = upstreams.iter().find(|u| !seen.insert(&u.uri)) {
+            return Err(ProxyError::Config(format!(
+                "duplicate upstream address: {}",
+                dup.uri
+            )));
+        }
+
         let blocked_headers = self
             .blocked_headers
-            .into_iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect();
+            .iter()
+            .map(|h| {
+                HeaderName::from_bytes(h.as_bytes()).map_err(|e| {
+                    ProxyError::Config(format!("invalid blocked header name \"{h}\": {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let mask_rules = self
             .masked_params
@@ -492,6 +495,43 @@ impl Config {
         let max_concurrent_requests = self
             .max_concurrent_requests
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
+        if max_concurrent_requests == 0 {
+            return Err(ProxyError::Config(
+                "max_concurrent_requests must be positive".into(),
+            ));
+        }
+
+        if let Some(rl) = self.rate_limit.as_ref() {
+            if rl.requests_per_second == 0 {
+                return Err(ProxyError::Config(
+                    "rate_limit.requests_per_second must be positive".into(),
+                ));
+            }
+            if rl.burst == 0 {
+                return Err(ProxyError::Config(
+                    "rate_limit.burst must be positive".into(),
+                ));
+            }
+        }
+
+        if let Some(hc) = self.health_check.as_ref() {
+            if hc.unhealthy_threshold == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.unhealthy_threshold must be positive".into(),
+                ));
+            }
+            if hc.healthy_threshold == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.healthy_threshold must be positive".into(),
+                ));
+            }
+            if !hc.path.starts_with('/') {
+                return Err(ProxyError::Config(format!(
+                    "health_check.path must begin with '/': \"{}\"",
+                    hc.path
+                )));
+            }
+        }
 
         let failure_threshold = self
             .health_check
@@ -502,13 +542,6 @@ impl Config {
             .health_check
             .as_ref()
             .map_or(DEFAULT_HEALTHY_THRESHOLD, |hc| hc.healthy_threshold);
-
-        let health_check_cooldown = self
-            .health_check
-            .as_ref()
-            .map_or(DEFAULT_HEALTH_CHECK_COOLDOWN, |hc| {
-                Duration::from_secs(hc.cooldown)
-            });
 
         let shutdown_timeout = self
             .shutdown_timeout
@@ -531,7 +564,6 @@ impl Config {
             health_check: self.health_check,
             failure_threshold,
             healthy_threshold,
-            health_check_cooldown,
             rate_limit: self.rate_limit,
             shutdown_timeout,
         })
@@ -589,7 +621,6 @@ mod tests {
         assert_eq!(config.masked_params, vec!["password", "ssn", "credit_card"]);
         assert_eq!(config.timeouts.connect, 5);
         assert_eq!(config.timeouts.request, 30);
-        assert_eq!(config.timeouts.idle, 60);
         assert_eq!(config.pool.idle_timeout, 60);
         assert_eq!(config.pool.max_idle_per_host, 32);
         assert_eq!(config.max_concurrent_requests, Some(1000));
@@ -628,7 +659,110 @@ mod tests {
             ..Default::default()
         };
         let rt = config.into_runtime().expect("valid config");
-        assert_eq!(rt.blocked_headers, vec!["x-custom-header"]);
+        assert_eq!(
+            rt.blocked_headers,
+            vec![HeaderName::from_static("x-custom-header")]
+        );
+    }
+
+    #[test]
+    fn into_runtime_rejects_invalid_blocked_header_name() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_headers: vec!["invalid header".into()],
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_duplicate_upstreams() {
+        let config = Config {
+            upstreams: vec![
+                UpstreamConfig {
+                    address: "http://backend:3000".into(),
+                    weight: 1,
+                },
+                UpstreamConfig {
+                    address: "http://backend:3000".into(),
+                    weight: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_max_concurrent_requests() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            max_concurrent_requests: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_rate_limit_rps() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            rate_limit: Some(RateLimitConfig {
+                requests_per_second: 0,
+                burst: 50,
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_rate_limit_burst() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            rate_limit: Some(RateLimitConfig {
+                requests_per_second: 100,
+                burst: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_thresholds() {
+        let unhealthy = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                unhealthy_threshold: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(unhealthy.into_runtime().is_err());
+
+        let healthy = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                healthy_threshold: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(healthy.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_health_path_without_leading_slash() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                path: "health".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
     }
 
     #[test]
@@ -789,9 +923,9 @@ mod tests {
         let rt = config.into_runtime().unwrap();
         assert_eq!(rt.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
         assert_eq!(rt.healthy_threshold, DEFAULT_HEALTHY_THRESHOLD);
-        assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
         assert!(rt.health_check.is_some());
         let hc = rt.health_check.as_ref().unwrap();
+        assert_eq!(hc.cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN.as_secs());
         assert_eq!(hc.timeout, DEFAULT_HEALTH_CHECK_TIMEOUT.as_secs());
     }
 
@@ -815,7 +949,6 @@ mod tests {
             timeouts: TimeoutsConfig {
                 connect: 2,
                 request: 10,
-                idle: 120,
             },
             pool: PoolConfig {
                 idle_timeout: 90,

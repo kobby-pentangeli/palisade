@@ -52,17 +52,19 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Constructs a new [`HttpClient`] for plain HTTP upstream connections.
 pub fn build_client(config: &RuntimeConfig) -> HttpClient {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(config.connect_timeout));
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(config.pool_idle_timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
-        .build(HttpConnector::new())
+        .build(connector)
 }
 
 /// Constructs a new [`HttpsClient`] capable of both HTTP and HTTPS
-/// upstream connections, using the platform root certificate store for
+/// upstream connections, using the Mozilla root certificate store for
 /// server verification.
 pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
-    let connector = tls::build_https_connector();
+    let connector = tls::build_https_connector(config.connect_timeout);
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(config.pool_idle_timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
@@ -184,10 +186,8 @@ where
                 .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
         );
 
-        config.blocked_headers.iter().for_each(|blocked| {
-            if let Ok(name) = HeaderName::from_bytes(blocked.as_bytes()) {
-                parts.headers.remove(&name);
-            }
+        config.blocked_headers.iter().for_each(|name| {
+            parts.headers.remove(name);
         });
 
         parts.uri = rewritten_uri;
@@ -199,6 +199,7 @@ where
         );
 
         let start = std::time::Instant::now();
+        let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let boxed_body = body.map_err(|e| e.into()).boxed();
         let proxy_req = Request::from_parts(parts, boxed_body);
 
@@ -213,7 +214,7 @@ where
                 let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     error = %e,
-                    latency_ms = start.elapsed().as_millis() as u64,
+                    latency_ms = elapsed_ms(),
                     upstream = %upstream_uri_target,
                     marked_unhealthy = transitioned,
                     "upstream request failed"
@@ -224,7 +225,7 @@ where
                 let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     timeout = ?config.request_timeout,
-                    latency_ms = start.elapsed().as_millis() as u64,
+                    latency_ms = elapsed_ms(),
                     upstream = %upstream_uri_target,
                     marked_unhealthy = transitioned,
                     "upstream request timed out"
@@ -233,7 +234,7 @@ where
             }
         };
 
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let latency_ms = elapsed_ms();
         info!(
             status = upstream_resp.status().as_u16(),
             latency_ms,
@@ -269,14 +270,10 @@ fn inspect_get_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()
     config
         .blocked_headers
         .iter()
-        .find(|blocked| {
-            HeaderName::from_bytes(blocked.as_bytes())
-                .ok()
-                .is_some_and(|name| headers.contains_key(&name))
-        })
+        .find(|name| headers.contains_key(*name))
         .map_or(Ok(()), |name| {
             warn!(header = %name, "blocked header detected");
-            Err(ProxyError::BlockedHeader(name.clone()))
+            Err(ProxyError::BlockedHeader(name.to_string()))
         })?;
 
     let query = req.uri().query().unwrap_or_default();

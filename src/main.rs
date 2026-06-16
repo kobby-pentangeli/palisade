@@ -89,7 +89,10 @@ async fn main() {
             burst = rl_cfg.burst,
             "per-IP rate limiting enabled"
         );
-        IpRateLimiter::from_config(rl_cfg).expect("rate limiter from config should not fail here")
+        IpRateLimiter::from_config(rl_cfg).unwrap_or_else(|e| {
+            error!(%e, "failed to initialize rate limiter");
+            std::process::exit(1);
+        })
     });
 
     info!(
@@ -137,6 +140,7 @@ async fn main() {
             config.failure_threshold,
             config.healthy_threshold,
             Duration::from_secs(hc.timeout),
+            config.connect_timeout,
         )
     });
 
