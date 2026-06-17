@@ -89,6 +89,48 @@ async fn connection_cap_drops_excess_connections() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_closes_idle_keepalive_connection() {
+    init_tracing();
+    let (backend_addr, _backend) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+
+    let config = Config {
+        upstreams: vec![UpstreamConfig {
+            address: format!("http://{backend_addr}"),
+            weight: 1,
+        }],
+        ..Default::default()
+    };
+    let (proxy_addr, shutdown) = spawn_proxy(config).await;
+
+    // Issue one request and read the response, leaving the keep-alive
+    // connection open and idle.
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert!(n > 0, "expected a response on the keep-alive connection");
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains("200 OK"),
+        "expected a 200 response before shutdown"
+    );
+
+    // Initiating shutdown must gracefully close the idle connection well
+    // within the drain window rather than holding it until the timeout.
+    drop(shutdown);
+
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut rest)).await;
+    assert!(
+        closed.is_ok(),
+        "graceful shutdown should close the idle keep-alive connection within the window"
+    );
+}
+
+#[tokio::test]
 async fn header_read_timeout_closes_stalled_connection() {
     init_tracing();
     let (backend_addr, _backend) = start_backend(StatusCode::OK, "text/plain", "ok").await;

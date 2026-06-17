@@ -434,6 +434,105 @@ pub async fn start_tls_backend(
     (addr, tx)
 }
 
+/// Starts a TLS backend that advertises `h2` and `http/1.1` via ALPN and
+/// serves each connection with the automatic HTTP/1.1-or-HTTP/2 builder.
+///
+/// Every request is answered with a `200 OK` whose body is the negotiated
+/// protocol version (e.g. `HTTP/2.0`), letting a test assert which protocol
+/// the proxy used on the upstream leg.
+pub async fn start_alpn_tls_backend(
+    cert_pem: &str,
+    key_pem: &str,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind ALPN TLS test backend");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut shutdown = std::pin::pin!(async {
+            let _ = rx.await;
+        });
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let tls_acceptor = tls_acceptor.clone();
+                    tokio::spawn(async move {
+                        let tls_stream = match tls_acceptor.accept(stream).await {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let service = service_fn(move |req: Request<Incoming>| async move {
+                            let version = format!("{:?}", req.version());
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from(version)))
+                                    .expect("test response must build"),
+                            )
+                        });
+                        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(tls_stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
+    });
+
+    (addr, tx)
+}
+
+/// Builds an HTTPS client that trusts the given self-signed certificate and
+/// negotiates HTTP/2 or HTTP/1.1 with the upstream over ALPN.
+pub fn test_h2_https_client(cert_pem: &str) -> palisade::HttpsClient {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &cert_der {
+        root_store.add(cert.clone()).unwrap();
+    }
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_all_versions()
+        .build();
+
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
 /// Builds an HTTPS client that trusts the given self-signed certificate.
 pub fn test_https_client(cert_pem: &str) -> palisade::HttpsClient {
     use rustls::pki_types::CertificateDer;

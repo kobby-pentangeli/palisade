@@ -11,6 +11,7 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 
 - *Weighted round-robin load balancing* across multiple upstreams
 - *Active and passive health checks* with configurable thresholds and cooldowns
+- *HTTP/1.1 and HTTP/2* with ALPN negotiation on the listener and to HTTPS upstreams
 - *TLS termination* (HTTPS clients) and *TLS origination* (HTTPS upstreams) via rustls
 - *Per-IP rate limiting* (GCRA token bucket) with automatic stale-entry cleanup
 - *Request policy enforcement*: header blocking, query parameter blocking, body size limits

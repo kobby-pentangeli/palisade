@@ -30,10 +30,14 @@ pub fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     let certs = load_certs(&config.cert_path)?;
     let key = load_private_key(&config.key_path)?;
 
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| ProxyError::Tls(format!("failed to build TLS server config: {e}")))?;
+
+    // Advertise HTTP/2 ahead of HTTP/1.1 so ALPN-capable clients negotiate the
+    // multiplexed protocol while plain HTTP/1.1 clients still connect.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -43,6 +47,8 @@ pub fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 /// Uses the Mozilla root certificate store via [`webpki_roots`] for server
 /// verification. The resulting connector supports both `http://` and
 /// `https://` schemes; plain HTTP connections pass through unmodified.
+/// For `https://` upstreams it negotiates HTTP/2 or HTTP/1.1 over ALPN,
+/// allowing the proxy to multiplex requests to backends that support it.
 ///
 /// `connect_timeout` bounds the TCP connect phase of every upstream
 /// connection the resulting connector establishes.
@@ -63,7 +69,7 @@ pub fn build_https_connector(
     HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
-        .enable_http1()
+        .enable_all_versions()
         .wrap_connector(http)
 }
 

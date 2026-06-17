@@ -17,7 +17,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::HeaderName;
-use hyper::{Request, Response, Uri};
+use hyper::{Request, Response, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -204,6 +204,13 @@ where
         });
 
         parts.uri = rewritten_uri;
+
+        // The inbound and upstream legs are independent: the upstream
+        // protocol is chosen by its connection (plain HTTP/1.1, or ALPN
+        // negotiation for TLS), so the forwarded request must not inherit the
+        // client's negotiated version. An explicit HTTP/2 version would force
+        // the client to require h2 and fail against an HTTP/1-only upstream.
+        parts.version = Version::HTTP_11;
 
         debug!(
             headers = ?parts.headers,

@@ -12,9 +12,10 @@ use std::time::Duration;
 use http_body_util::BodyExt;
 use hyper::Response;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -43,9 +44,14 @@ pub struct ServerState {
 /// shared `state`. Generic over the client connector type so that both
 /// plain-HTTP and HTTPS upstreams use the same accept loop.
 ///
-/// Runs until `shutdown` resolves, then stops accepting new connections
-/// and waits up to `shutdown_timeout` for in-flight requests to drain.
-/// Any connections still active after the deadline are dropped.
+/// Each connection is served by an automatic HTTP/1.1-or-HTTP/2 builder:
+/// for TLS connections the protocol is selected by ALPN, and for cleartext
+/// connections by the HTTP/2 preface, falling back to HTTP/1.1.
+///
+/// Runs until `shutdown` resolves, then stops accepting new connections and
+/// initiates a graceful shutdown of every in-flight connection, waiting up
+/// to `shutdown_timeout` for them to close. Any connection still active
+/// after the deadline is aborted.
 pub async fn serve<C>(
     listener: TcpListener,
     client: hyper_util::client::legacy::Client<C, BoxBody>,
@@ -69,6 +75,14 @@ pub async fn serve<C>(
     let client_tls = tls_acceptor.is_some();
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
+    let graceful = GracefulShutdown::new();
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    builder.http2().timer(TokioTimer::new());
 
     tokio::pin!(shutdown);
 
@@ -105,6 +119,8 @@ pub async fn serve<C>(
                 let tls_acceptor = tls_acceptor.clone();
                 let balancer = balancer.clone();
                 let rate_limiter = rate_limiter.clone();
+                let builder = builder.clone();
+                let watcher = graceful.watcher();
 
                 connections.spawn(async move {
                     let _permit = permit;
@@ -166,11 +182,6 @@ pub async fn serve<C>(
                         }
                     });
 
-                    let mut builder = http1::Builder::new();
-                    builder
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(header_read_timeout);
-
                     let result = match tls_acceptor {
                         Some(acceptor) => {
                             let tls_stream = match acceptor.accept(stream).await {
@@ -180,14 +191,12 @@ pub async fn serve<C>(
                                     return;
                                 }
                             };
-                            builder
-                                .serve_connection(TokioIo::new(tls_stream), svc)
-                                .await
+                            let conn = builder.serve_connection(TokioIo::new(tls_stream), svc);
+                            watcher.watch(conn).await
                         }
                         None => {
-                            builder
-                                .serve_connection(TokioIo::new(stream), svc)
-                                .await
+                            let conn = builder.serve_connection(TokioIo::new(stream), svc);
+                            watcher.watch(conn).await
                         }
                     };
 
@@ -196,6 +205,8 @@ pub async fn serve<C>(
                     }
                 });
             }
+            // Reap completed connections so the set tracks only live ones.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             () = &mut shutdown => {
                 info!("shutting down, no longer accepting connections");
                 break;
@@ -203,27 +214,24 @@ pub async fn serve<C>(
         }
     }
 
-    if !connections.is_empty() {
-        let in_flight = connections.len();
+    let in_flight = graceful.count();
+    if in_flight > 0 {
         info!(
             in_flight,
             timeout = ?shutdown_timeout,
             "draining in-flight connections"
         );
+    }
 
-        let drain_result = tokio::time::timeout(shutdown_timeout, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await;
-
-        if drain_result.is_err() {
-            let remaining = connections.len();
-            warn!(
-                remaining,
-                "shutdown drain timeout exceeded, aborting remaining connections"
-            );
-            connections.shutdown().await;
-        }
+    if tokio::time::timeout(shutdown_timeout, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        warn!(
+            remaining = connections.len(),
+            "shutdown drain timeout exceeded, aborting remaining connections"
+        );
+        connections.shutdown().await;
     }
 }
 
