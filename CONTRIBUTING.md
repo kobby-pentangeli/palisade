@@ -35,6 +35,10 @@ To send a pull request, please:
 GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 
+## Development Setup
+
+For the toolchains, the canonical build/test/lint commands, the project layout, and how the test suite is organized, see the [Development Guide](./docs/development.md). For deploying the proxy, see the [Deployment Guide](./deploy/README.md); for the security posture and how to report a vulnerability, see [SECURITY.md](./SECURITY.md).
+
 ## Licensing
 
 See the [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE) files for this project's licensing. Kindly confirm the licensing of your contribution.
