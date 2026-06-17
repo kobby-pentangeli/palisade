@@ -7,7 +7,8 @@
 //! - **Termination (client -> proxy):** Accepts HTTPS connections using a
 //!   locally loaded certificate chain and private key.
 //! - **Origination (proxy -> upstream):** Initiates HTTPS connections to
-//!   upstream backends using the platform root certificate store.
+//!   upstream backends, verifying servers against the Mozilla root
+//!   certificate bundle vendored by [`webpki_roots`], not the OS trust store.
 
 use std::sync::Arc;
 use std::time::Duration;

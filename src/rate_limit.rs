@@ -66,9 +66,10 @@ impl IpRateLimiter {
     /// with the estimated wait time in milliseconds if the limit is exceeded.
     pub fn check(&self, ip: &IpAddr) -> std::result::Result<(), u64> {
         self.inner.check_key(ip).map_err(|not_until| {
-            not_until
+            let wait_ms = not_until
                 .wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
-                .as_millis() as u64
+                .as_millis();
+            u64::try_from(wait_ms).unwrap_or(u64::MAX)
         })
     }
 
