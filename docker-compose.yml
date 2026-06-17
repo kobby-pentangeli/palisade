@@ -1,0 +1,28 @@
+# Demo stack: the Palisade proxy in front of a throwaway echo backend.
+#
+#   docker compose up --build
+#   curl -i http://localhost:8100/
+#
+# The backend (`traefik/whoami`) echoes the request it receives, so the
+# response shows the `X-Forwarded-For`/`X-Forwarded-Proto`/`Host` headers the
+# proxy injected and the upstream it was routed to.
+services:
+  palisade:
+    build: .
+    image: palisade:0.2.0
+    ports:
+      - "8100:8100"
+      # Admin metrics/probes, published to the host loopback only so the
+      # operational surface is never world-reachable. Scrape http://127.0.0.1:9100/metrics.
+      - "127.0.0.1:9100:9100"
+    volumes:
+      - ./deploy/config.docker.toml:/etc/palisade/config.toml:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    image: traefik/whoami:v1.10
+    expose:
+      - "80"
+    restart: unless-stopped
