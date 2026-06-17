@@ -89,12 +89,41 @@ pub fn test_config_with_stripping(addr: SocketAddr) -> Arc<RuntimeConfig> {
     )
 }
 
+/// Builds a `RuntimeConfig` that trusts client-supplied `X-Forwarded-*`
+/// headers, modelling deployment behind another trusted proxy.
+pub fn test_config_trusting_forwarded(addr: SocketAddr) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstreams: single_upstream(addr),
+            trust_forwarded_headers: true,
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
 /// Builds a `RuntimeConfig` with a specific body size limit.
 pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeConfig> {
     Arc::new(
         Config {
             upstreams: single_upstream(addr),
             max_body_size: Some(limit),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
+/// Builds a `RuntimeConfig` that masks `password` but only buffers responses
+/// up to `ceiling` bytes for masking.
+pub fn test_config_with_mask_ceiling(addr: SocketAddr, ceiling: u64) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstreams: single_upstream(addr),
+            masked_params: vec!["password".into()],
+            mask_max_body_size: Some(ceiling),
             ..Default::default()
         }
         .into_runtime()
@@ -127,7 +156,7 @@ pub fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<Runtim
 
 /// Builds a [`LoadBalancer`] backed by the upstream(s) in the given config.
 pub fn test_balancer(config: &RuntimeConfig) -> LoadBalancer {
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     LoadBalancer::new(pool)
 }
 
@@ -161,6 +190,57 @@ pub async fn start_backend(
                                 Response::builder()
                                     .status(status)
                                     .header("content-type", content_type)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("test response must build"),
+                            )
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
+    });
+
+    (addr, tx)
+}
+
+/// Starts a local HTTP server that answers every request with the given
+/// status and body, tagged with both a `Content-Type` and a `Content-Encoding`
+/// header. Used to verify the proxy never decodes a content-encoded body as
+/// text for masking.
+pub async fn start_encoded_backend(
+    content_type: &'static str,
+    content_encoding: &'static str,
+    body: &'static str,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut shutdown = std::pin::pin!(async {
+            let _ = rx.await;
+        });
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(move |_req: Request<Incoming>| {
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", content_type)
+                                    .header("content-encoding", content_encoding)
                                     .body(Full::new(Bytes::from(body)))
                                     .expect("test response must build"),
                             )
@@ -405,8 +485,142 @@ pub async fn start_tls_backend(
     (addr, tx)
 }
 
+/// Starts a TLS backend that advertises `h2` and `http/1.1` via ALPN and
+/// serves each connection with the automatic HTTP/1.1-or-HTTP/2 builder.
+///
+/// Every request is answered with a `200 OK` whose body is the negotiated
+/// protocol version (e.g. `HTTP/2.0`), letting a test assert which protocol
+/// the proxy used on the upstream leg.
+pub async fn start_alpn_tls_backend(
+    cert_pem: &str,
+    key_pem: &str,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind ALPN TLS test backend");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut shutdown = std::pin::pin!(async {
+            let _ = rx.await;
+        });
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let tls_acceptor = tls_acceptor.clone();
+                    tokio::spawn(async move {
+                        let tls_stream = match tls_acceptor.accept(stream).await {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let service = service_fn(move |req: Request<Incoming>| async move {
+                            let version = format!("{:?}", req.version());
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from(version)))
+                                    .expect("test response must build"),
+                            )
+                        });
+                        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(tls_stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
+    });
+
+    (addr, tx)
+}
+
+/// Builds an HTTPS client that trusts the given self-signed certificate and
+/// negotiates HTTP/2 or HTTP/1.1 with the upstream over ALPN.
+pub fn test_h2_https_client(cert_pem: &str) -> palisade::HttpsClient {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &cert_der {
+        root_store.add(cert.clone()).unwrap();
+    }
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_all_versions()
+        .build();
+
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
 /// Builds an HTTPS client that trusts the given self-signed certificate.
 pub fn test_https_client(cert_pem: &str) -> palisade::HttpsClient {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &cert_der {
+        root_store.add(cert.clone()).unwrap();
+    }
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
+/// Builds an HTTPS probe client (empty request body) that trusts the given
+/// self-signed certificate, for exercising the active health checker against
+/// a TLS backend.
+pub fn test_https_probe_client(
+    cert_pem: &str,
+) -> Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Empty<Bytes>,
+> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
 

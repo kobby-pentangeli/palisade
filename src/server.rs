@@ -7,20 +7,24 @@
 //! handling or `std::process::exit`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use http_body_util::BodyExt;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use hyper::Response;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::{BoxBody, IpRateLimiter, LoadBalancer, ProxyError, RuntimeConfig, handle_request};
+use crate::{
+    BoxBody, IpRateLimiter, LoadBalancer, Metrics, ProxyError, RuntimeConfig, handle_request,
+};
 
 /// Runtime state shared across the accept loop.
 pub struct ServerState {
@@ -32,10 +36,16 @@ pub struct ServerState {
     pub semaphore: Arc<Semaphore>,
     /// Cached value of the semaphore capacity, used in error messages.
     pub concurrency_limit: usize,
+    /// Bounds the number of simultaneously open client connections. Shared
+    /// with the admin listener so the connection-saturation gauge reflects it.
+    pub connection_semaphore: Arc<Semaphore>,
     /// Per-IP rate limiter. `None` disables rate limiting.
     pub rate_limiter: Option<IpRateLimiter>,
     /// TLS acceptor for client-facing connections. `None` means plain HTTP.
     pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    /// Proxy metrics. `None` when the admin listener is disabled, in which
+    /// case no per-request metrics are recorded.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Accepts connections on `listener`, optionally wrapping each in TLS, and
@@ -43,9 +53,14 @@ pub struct ServerState {
 /// shared `state`. Generic over the client connector type so that both
 /// plain-HTTP and HTTPS upstreams use the same accept loop.
 ///
-/// Runs until `shutdown` resolves, then stops accepting new connections
-/// and waits up to `shutdown_timeout` for in-flight requests to drain.
-/// Any connections still active after the deadline are dropped.
+/// Each connection is served by an automatic HTTP/1.1-or-HTTP/2 builder:
+/// for TLS connections the protocol is selected by ALPN, and for cleartext
+/// connections by the HTTP/2 preface, falling back to HTTP/1.1.
+///
+/// Runs until `shutdown` resolves, then stops accepting new connections and
+/// initiates a graceful shutdown of every in-flight connection, waiting up
+/// to `shutdown_timeout` for them to close. Any connection still active
+/// after the deadline is aborted.
 pub async fn serve<C>(
     listener: TcpListener,
     client: hyper_util::client::legacy::Client<C, BoxBody>,
@@ -59,12 +74,25 @@ pub async fn serve<C>(
         balancer,
         semaphore,
         concurrency_limit,
+        connection_semaphore,
         rate_limiter,
         tls_acceptor,
+        metrics,
     } = state;
 
     let shutdown_timeout = config.shutdown_timeout;
+    let max_connections = config.max_connections;
+    let header_read_timeout = config.header_read_timeout;
+    let client_tls = tls_acceptor.is_some();
     let mut connections = JoinSet::new();
+    let graceful = GracefulShutdown::new();
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    builder.http2().timer(TokioTimer::new());
 
     tokio::pin!(shutdown);
 
@@ -83,72 +111,80 @@ pub async fn serve<C>(
                     warn!(%e, "failed to set TCP_NODELAY");
                 }
 
+                let permit = match Arc::clone(&connection_semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            limit = max_connections,
+                            %client_addr,
+                            "max connections reached, dropping connection"
+                        );
+                        continue;
+                    }
+                };
+
                 let client = client.clone();
                 let config = Arc::clone(&config);
                 let semaphore = Arc::clone(&semaphore);
                 let tls_acceptor = tls_acceptor.clone();
                 let balancer = balancer.clone();
                 let rate_limiter = rate_limiter.clone();
+                let metrics = metrics.clone();
+                let builder = builder.clone();
+                let watcher = graceful.watcher();
 
                 connections.spawn(async move {
+                    let _permit = permit;
                     let svc = service_fn(move |req: hyper::Request<Incoming>| {
                         let client = client.clone();
                         let config = Arc::clone(&config);
                         let semaphore = Arc::clone(&semaphore);
                         let balancer = balancer.clone();
                         let rate_limiter = rate_limiter.clone();
+                        let metrics = metrics.clone();
                         async move {
-                            let _permit = match semaphore.try_acquire() {
-                                Ok(permit) => permit,
+                            let started = Instant::now();
+                            let resp = match Arc::clone(&semaphore).try_acquire_owned() {
                                 Err(_) => {
                                     warn!(
                                         limit = concurrency_limit,
                                         "concurrency limit reached, rejecting request"
                                     );
-                                    let err = ProxyError::ServiceUnavailable {
+                                    ProxyError::ServiceUnavailable {
                                         limit: concurrency_limit,
-                                    };
-                                    return Ok::<Response<BoxBody>, std::convert::Infallible>(
-                                        err.into_response().map(|b| {
-                                            b.map_err(
-                                                |never| -> Box<
-                                                    dyn std::error::Error + Send + Sync,
-                                                > {
-                                                    match never {}
-                                                },
-                                            )
-                                            .boxed()
-                                        }),
-                                    );
+                                    }
+                                    .into_response()
+                                    .map(box_error_body)
                                 }
+                                Ok(_permit) => match handle_request(
+                                    req,
+                                    client,
+                                    config,
+                                    balancer,
+                                    client_addr,
+                                    client_tls,
+                                    rate_limiter.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        if let Some(m) = metrics.as_deref() {
+                                            if matches!(e, ProxyError::RateLimited { .. }) {
+                                                m.record_rate_limited();
+                                            }
+                                        }
+                                        e.into_response().map(box_error_body)
+                                    }
+                                },
                             };
 
-                            let resp = handle_request(
-                                req,
-                                client,
-                                config,
-                                balancer,
-                                client_addr,
-                                rate_limiter.as_ref(),
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                e.into_response().map(|b| {
-                                    b.map_err(
-                                        |never| -> Box<
-                                            dyn std::error::Error + Send + Sync,
-                                        > {
-                                            match never {}
-                                        },
-                                    )
-                                    .boxed()
-                                })
-                            });
+                            if let Some(m) = metrics.as_deref() {
+                                m.record_response(resp.status().as_u16(), started.elapsed());
+                            }
                             Ok::<Response<BoxBody>, std::convert::Infallible>(resp)
                         }
                     });
-
-                    let builder = http1::Builder::new();
 
                     let result = match tls_acceptor {
                         Some(acceptor) => {
@@ -159,14 +195,12 @@ pub async fn serve<C>(
                                     return;
                                 }
                             };
-                            builder
-                                .serve_connection(TokioIo::new(tls_stream), svc)
-                                .await
+                            let conn = builder.serve_connection(TokioIo::new(tls_stream), svc);
+                            watcher.watch(conn).await
                         }
                         None => {
-                            builder
-                                .serve_connection(TokioIo::new(stream), svc)
-                                .await
+                            let conn = builder.serve_connection(TokioIo::new(stream), svc);
+                            watcher.watch(conn).await
                         }
                     };
 
@@ -175,6 +209,8 @@ pub async fn serve<C>(
                     }
                 });
             }
+            // Reap completed connections so the set tracks only live ones.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             () = &mut shutdown => {
                 info!("shutting down, no longer accepting connections");
                 break;
@@ -182,52 +218,43 @@ pub async fn serve<C>(
         }
     }
 
-    if !connections.is_empty() {
-        let in_flight = connections.len();
+    let in_flight = graceful.count();
+    if in_flight > 0 {
         info!(
             in_flight,
             timeout = ?shutdown_timeout,
             "draining in-flight connections"
         );
+    }
 
-        let drain_result = tokio::time::timeout(shutdown_timeout, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await;
-
-        if drain_result.is_err() {
-            let remaining = connections.len();
-            warn!(
-                remaining,
-                "shutdown drain timeout exceeded, aborting remaining connections"
-            );
-            connections.shutdown().await;
-        }
+    if tokio::time::timeout(shutdown_timeout, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        warn!(
+            remaining = connections.len(),
+            "shutdown drain timeout exceeded, aborting remaining connections"
+        );
+        connections.shutdown().await;
     }
 }
 
 /// Spawns a background task that periodically probes each upstream backend
 /// at the configured health check path, updating health state based on
 /// HTTP response status.
-///
-/// The `timeout` parameter bounds each individual probe request. Backends
-/// that accumulate `failure_threshold` consecutive failures are marked
-/// unhealthy. Unhealthy backends that accumulate `healthy_threshold`
-/// consecutive successes are promoted back to healthy.
-pub fn spawn_health_checker(
+pub fn spawn_health_checker<C>(
     balancer: LoadBalancer,
+    client: hyper_util::client::legacy::Client<C, http_body_util::Empty<bytes::Bytes>>,
     interval: Duration,
     path: &str,
     failure_threshold: u32,
     healthy_threshold: u32,
     timeout: Duration,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
     let path = path.to_owned();
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
-
-    let client: hyper_util::client::legacy::Client<_, http_body_util::Empty<bytes::Bytes>> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(connector);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -349,4 +376,11 @@ pub async fn shutdown_signal() {
         ctrl_c.await.expect("failed to listen for Ctrl+C");
         info!("received Ctrl+C, initiating graceful shutdown");
     }
+}
+
+/// Boxes the infallible `Full<Bytes>` body produced by an error response into
+/// the proxy's unified [`BoxBody`].
+fn box_error_body(body: Full<Bytes>) -> BoxBody {
+    body.map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed()
 }

@@ -1,0 +1,18 @@
+# Palisade configuration for the docker-compose demo stack.
+# Binds all interfaces inside the container and forwards to the `backend`
+# service on the compose network.
+
+listen = "0.0.0.0:8100"
+
+strip_response_headers = ["server", "x-powered-by"]
+
+[[upstreams]]
+address = "http://backend:80"
+weight = 1
+
+[timeouts]
+connect = 5
+request = 30
+
+[admin]
+listen = "0.0.0.0:9100"

@@ -5,19 +5,20 @@
 //! defense) and policy enforcement (header/param blocking, body size
 //! limits, response masking, load balancing).
 //!
-//! Every inbound request is assigned a monotonically increasing request ID
-//! and wrapped in a [`tracing::Span`] carrying structured fields for
-//! observability.
+//! Every inbound request is assigned a request ID---a validated inbound
+//! `X-Request-Id` when the client supplies one, otherwise a monotonic
+//! per-process counter---and wrapped in a [`tracing::Span`] carrying
+//! structured fields for observability.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::HeaderName;
-use hyper::{Method, Request, Response, Uri};
+use hyper::{Request, Response, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -25,6 +26,10 @@ use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::{IpRateLimiter, LoadBalancer, ProxyError, Result, RuntimeConfig, headers, tls};
+
+/// Maximum accepted length of an inbound `X-Request-Id`. Bounds the value the
+/// proxy echoes and logs, defending against oversized or log-injecting ids.
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
 type StdError = Box<dyn std::error::Error + Send + Sync>;
@@ -52,17 +57,19 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Constructs a new [`HttpClient`] for plain HTTP upstream connections.
 pub fn build_client(config: &RuntimeConfig) -> HttpClient {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(config.connect_timeout));
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(config.pool_idle_timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
-        .build(HttpConnector::new())
+        .build(connector)
 }
 
 /// Constructs a new [`HttpsClient`] capable of both HTTP and HTTPS
-/// upstream connections, using the platform root certificate store for
+/// upstream connections, using the Mozilla root certificate store for
 /// server verification.
 pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
-    let connector = tls::build_https_connector();
+    let connector = tls::build_https_connector(config.connect_timeout);
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(config.pool_idle_timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
@@ -77,18 +84,25 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///    checked against the per-IP token bucket. Requests exceeding the limit
 ///    receive a 429 Too Many Requests response with a `Retry-After` header.
 /// 2. **Request smuggling defense** — Rejects requests carrying both
-///    `Content-Length` and `Transfer-Encoding` headers (RFC 7230 §3.3.3).
-/// 3. **Body size enforcement** — Rejects requests whose `Content-Length`
-///    exceeds the configured `max_body_size` with 413 Payload Too Large.
-/// 4. **GET inspection** — If the request method is GET, blocked headers and
-///    query parameters are checked. Requests matching any block rule receive
-///    a 403 Forbidden response.
+///    `Content-Length` and `Transfer-Encoding` headers (RFC 9112 §6.1).
+/// 3. **Body size enforcement** — Rejects requests whose declared
+///    `Content-Length` exceeds `max_body_size` up front, and wraps the
+///    forwarded body in a length limit so an oversized or chunked body is
+///    rejected on actual byte count mid-stream with 413 Payload Too Large.
+/// 4. **Policy inspection** — On every method, blocked headers and query
+///    parameters are checked. The query string is parsed into decoded
+///    key/value pairs and matched by exact key, so a substring or
+///    percent-encoded parameter name cannot bypass a block rule. Requests
+///    matching any rule receive a 403 Forbidden response.
 /// 5. **Upstream selection** — The round-robin balancer selects the next
 ///    healthy backend. If none are available, returns 503.
 /// 6. **Hop-by-hop stripping** — Connection-scoped headers are removed
-///    before forwarding, per RFC 7230 §6.1.
+///    before forwarding, per RFC 9110 §7.6.1.
 /// 7. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
 ///    `X-Forwarded-Host` are injected to preserve client origin metadata.
+///    `X-Forwarded-Proto` reflects the actual inbound scheme; unless
+///    `trust_forwarded_headers` is enabled, `X-Forwarded-For` is replaced
+///    with the observed client address rather than trusting client input.
 /// 8. **Host rewriting** — The `Host` header is set to the upstream authority.
 /// 9. **URI rewriting** — The request URI is rewritten to target the selected
 ///    upstream, preserving the original path and query string.
@@ -101,17 +115,20 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///     removed from the upstream response.
 /// 13. **Response header stripping** — Configured internal headers (e.g.
 ///     `Server`, `X-Powered-By`) are removed from the response.
-/// 14. **Response masking** — For text-based upstream responses, sensitive
-///     parameter values are masked before returning to the client.
-/// 15. **Request ID injection** — An `X-Request-Id` header carrying the
-///     monotonic request ID is added to every response for client-side
-///     log correlation.
+/// 14. **Response masking** — For text-based upstream responses within the
+///     configured masking ceiling, sensitive parameter values are masked
+///     before returning to the client; larger or unbounded responses stream
+///     through unmasked rather than being buffered.
+/// 15. **Request ID injection** — An `X-Request-Id` header is added to every
+///     response for client-side log correlation: a validated inbound id is
+///     propagated when present, otherwise the monotonic per-process id is used.
 pub async fn handle_request<B, C>(
     req: Request<B>,
     client: Client<C, BoxBody>,
     config: Arc<RuntimeConfig>,
     balancer: LoadBalancer,
     client_addr: SocketAddr,
+    client_tls: bool,
     rate_limiter: Option<&IpRateLimiter>,
 ) -> Result<Response<BoxBody>>
 where
@@ -119,13 +136,14 @@ where
     B::Error: Into<StdError>,
     C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
 {
-    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let seq = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let request_id = inbound_request_id(req.headers()).unwrap_or_else(|| seq.to_string());
     let method = req.method().clone();
     let uri = req.uri().clone();
 
     let span = tracing::info_span!(
         "request",
-        id = request_id,
+        id = %request_id,
         method = %method,
         uri = %uri,
         client = %client_addr,
@@ -164,9 +182,7 @@ where
             });
         }
 
-        if method == Method::GET {
-            inspect_get_request(&req, &config)?;
-        }
+        inspect_request(&req, &config)?;
 
         let upstream = balancer.next()?;
         let upstream_uri_target = upstream.uri();
@@ -176,7 +192,12 @@ where
         let (mut parts, body) = req.into_parts();
 
         headers::strip_hop_by_hop(&mut parts.headers);
-        headers::inject_forwarding_headers(&mut parts.headers, client_addr);
+        headers::inject_forwarding_headers(
+            &mut parts.headers,
+            client_addr,
+            client_tls,
+            config.trust_forwarded_headers,
+        );
         headers::rewrite_host(
             &mut parts.headers,
             upstream_uri_target
@@ -184,13 +205,18 @@ where
                 .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
         );
 
-        config.blocked_headers.iter().for_each(|blocked| {
-            if let Ok(name) = HeaderName::from_bytes(blocked.as_bytes()) {
-                parts.headers.remove(&name);
-            }
+        config.blocked_headers.iter().for_each(|name| {
+            parts.headers.remove(name);
         });
 
         parts.uri = rewritten_uri;
+
+        // The inbound and upstream legs are independent: the upstream
+        // protocol is chosen by its connection (plain HTTP/1.1, or ALPN
+        // negotiation for TLS), so the forwarded request must not inherit the
+        // client's negotiated version. An explicit HTTP/2 version would force
+        // the client to require h2 and fail against an HTTP/1-only upstream.
+        parts.version = Version::HTTP_11;
 
         debug!(
             headers = ?parts.headers,
@@ -199,8 +225,9 @@ where
         );
 
         let start = std::time::Instant::now();
-        let boxed_body = body.map_err(|e| e.into()).boxed();
-        let proxy_req = Request::from_parts(parts, boxed_body);
+        let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let body_limit = usize::try_from(config.max_body_size).unwrap_or(usize::MAX);
+        let proxy_req = Request::from_parts(parts, Limited::new(body, body_limit).boxed());
 
         let upstream_result = timeout(config.request_timeout, client.request(proxy_req)).await;
 
@@ -210,10 +237,20 @@ where
                 resp
             }
             Ok(Err(e)) => {
+                if is_length_limit_error(&e) {
+                    warn!(
+                        limit = config.max_body_size,
+                        upstream = %upstream_uri_target,
+                        "request body exceeded size limit mid-stream"
+                    );
+                    return Err(ProxyError::BodyTooLarge {
+                        limit: config.max_body_size,
+                    });
+                }
                 let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     error = %e,
-                    latency_ms = start.elapsed().as_millis() as u64,
+                    latency_ms = elapsed_ms(),
                     upstream = %upstream_uri_target,
                     marked_unhealthy = transitioned,
                     "upstream request failed"
@@ -224,7 +261,7 @@ where
                 let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     timeout = ?config.request_timeout,
-                    latency_ms = start.elapsed().as_millis() as u64,
+                    latency_ms = elapsed_ms(),
                     upstream = %upstream_uri_target,
                     marked_unhealthy = transitioned,
                     "upstream request timed out"
@@ -233,7 +270,7 @@ where
             }
         };
 
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let latency_ms = elapsed_ms();
         info!(
             status = upstream_resp.status().as_u16(),
             latency_ms,
@@ -250,43 +287,64 @@ where
         }
 
         let mut resp = build_response(upstream_resp, &config).await?;
-        resp.headers_mut().insert(
-            HeaderName::from_static("x-request-id"),
-            hyper::header::HeaderValue::from(request_id),
-        );
+        let id_value = hyper::header::HeaderValue::from_str(&request_id)
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from(seq));
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), id_value);
         Ok(resp)
     }
     .instrument(span)
     .await
 }
 
-/// Checks a GET request against configured block rules.
+/// Extracts a client-supplied `X-Request-Id` to propagate, if present and
+/// well-formed. Accepts a non-empty, length-bounded value of visible ASCII
+/// characters; anything else is rejected so the proxy falls back to its own
+/// monotonic identifier.
+fn inbound_request_id(headers: &hyper::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_REQUEST_ID_LEN
+                && id.bytes().all(|b| b.is_ascii_graphic())
+        })
+        .map(str::to_owned)
+}
+
+/// Checks a request against configured block rules, regardless of method.
+///
+/// Blocked headers are matched by name. Blocked query parameters are matched
+/// against the decoded query string by exact key, so neither a substring
+/// (`secret_key` does not match `my_secret_key`) nor a percent-encoded name
+/// can slip past a rule.
 ///
 /// Returns `ProxyError::BlockedHeader` or `ProxyError::BlockedParam`
 /// if any rule matches, allowing the caller to short-circuit with a 403.
-fn inspect_get_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()> {
+fn inspect_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()> {
     let headers = req.headers();
     config
         .blocked_headers
         .iter()
-        .find(|blocked| {
-            HeaderName::from_bytes(blocked.as_bytes())
-                .ok()
-                .is_some_and(|name| headers.contains_key(&name))
-        })
+        .find(|name| headers.contains_key(*name))
         .map_or(Ok(()), |name| {
             warn!(header = %name, "blocked header detected");
-            Err(ProxyError::BlockedHeader(name.clone()))
+            Err(ProxyError::BlockedHeader(name.to_string()))
         })?;
 
     let query = req.uri().query().unwrap_or_default();
-    config
-        .blocked_params
-        .iter()
-        .find(|param| query.contains(&format!("{param}=")))
-        .map_or(Ok(()), |name| {
-            warn!(param = %name, "blocked parameter detected");
-            Err(ProxyError::BlockedParam(name.clone()))
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| {
+            config
+                .blocked_params
+                .iter()
+                .any(|param| param.as_str() == key.as_ref())
+        })
+        .map_or(Ok(()), |(key, _)| {
+            warn!(param = %key, "blocked parameter detected");
+            Err(ProxyError::BlockedParam(key.into_owned()))
         })
 }
 
@@ -314,30 +372,56 @@ fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri> {
         .map_err(|e| ProxyError::Internal(format!("failed to build upstream URI: {e}")))
 }
 
+/// Returns `true` if any error in the chain is a body length-limit overflow,
+/// signalling that the forwarded request body exceeded `max_body_size`.
+fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |e| e.source()).any(|e| e.is::<LengthLimitError>())
+}
+
 /// Builds the client-facing response from the upstream response.
 ///
-/// For responses whose `Content-Type` indicates text or form-encoded data,
-/// the body is collected and scanned for sensitive parameter values. All
-/// other responses are streamed through unmodified.
+/// A response is buffered and scanned for sensitive parameter values only
+/// when masking is configured, its `Content-Type` indicates text or
+/// form-encoded data, it carries no content coding, and its declared
+/// `Content-Length` is within the configured masking ceiling. Every other
+/// response---no masking rules, non-text or content-encoded content, or a
+/// body that is unbounded or larger than the ceiling---is streamed through
+/// unmodified so the proxy never buffers an upstream body unboundedly and
+/// never decodes a compressed body as text. The collect is additionally
+/// bounded by the ceiling to guard against an upstream that understates its
+/// length.
 async fn build_response(
     upstream_resp: Response<Incoming>,
     config: &RuntimeConfig,
 ) -> Result<Response<BoxBody>> {
-    if config.mask_rules.is_empty() {
-        let (parts, body) = upstream_resp.into_parts();
-        return Ok(Response::from_parts(
-            parts,
-            body.map_err(|e| -> StdError { Box::new(e) }).boxed(),
-        ));
-    }
-
-    let should_mask = upstream_resp
+    let maskable_content_type = upstream_resp
         .headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .is_some_and(|ct| ct.contains("text/") || ct.contains("application/x-www-form-urlencoded"));
 
-    if !should_mask {
+    let content_encoded = upstream_resp
+        .headers()
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"));
+
+    let within_ceiling = upstream_resp
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|len| len <= config.mask_max_body_size);
+
+    if config.mask_rules.is_empty() || !maskable_content_type || content_encoded || !within_ceiling
+    {
+        if !config.mask_rules.is_empty() && maskable_content_type && !within_ceiling {
+            debug!(
+                ceiling = config.mask_max_body_size,
+                "maskable response has no declared length or exceeds masking ceiling; streaming unmasked"
+            );
+        }
         let (parts, body) = upstream_resp.into_parts();
         return Ok(Response::from_parts(
             parts,
@@ -346,23 +430,31 @@ async fn build_response(
     }
 
     let (parts, body) = upstream_resp.into_parts();
-    let body_bytes = body
+    let ceiling = usize::try_from(config.mask_max_body_size).unwrap_or(usize::MAX);
+    let body_bytes = Limited::new(body, ceiling)
         .collect()
         .await
-        .map_err(|e| ProxyError::Internal(format!("failed to read upstream body: {e}")))?
+        .map_err(|e| {
+            ProxyError::Internal(format!("failed to read upstream body for masking: {e}"))
+        })?
         .to_bytes();
 
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let masked = config.mask_sensitive_data(&body_str);
+    let masked = Bytes::from(config.mask_sensitive_data(&body_str));
+    let masked_len = masked.len();
 
     let mut response = Response::new(
-        Full::new(Bytes::from(masked))
+        Full::new(masked)
             .map_err(|never| -> StdError { match never {} })
             .boxed(),
     );
     *response.status_mut() = parts.status;
     *response.headers_mut() = parts.headers;
     *response.version_mut() = parts.version;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from(masked_len),
+    );
 
     Ok(response)
 }
@@ -370,6 +462,7 @@ async fn build_response(
 #[cfg(test)]
 mod tests {
     use http_body_util::Empty;
+    use hyper::Method;
 
     use super::*;
     use crate::Config;
@@ -407,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_get_detects_blocked_header() {
+    fn inspect_detects_blocked_header() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
@@ -423,12 +516,12 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = inspect_get_request(&req, &config);
+        let result = inspect_request(&req, &config);
         assert!(result.is_err());
     }
 
     #[test]
-    fn inspect_get_detects_blocked_param() {
+    fn inspect_detects_blocked_param() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_params: vec!["secret_key".into()],
@@ -443,12 +536,70 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = inspect_get_request(&req, &config);
+        let result = inspect_request(&req, &config);
         assert!(result.is_err());
     }
 
     #[test]
-    fn inspect_get_allows_clean_request() {
+    fn inspect_enforces_blocked_header_on_non_get() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_headers: vec!["x-bad-header".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://example.com/resource")
+            .header("x-bad-header", "anything")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_err());
+    }
+
+    #[test]
+    fn inspect_blocked_param_requires_exact_key() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_params: vec!["secret_key".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/?my_secret_key=abc123")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_ok());
+    }
+
+    #[test]
+    fn inspect_blocked_param_matches_percent_encoded_key() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_params: vec!["secret key".into()],
+            ..Default::default()
+        }
+        .into_runtime()
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/?secret%20key=abc123")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        assert!(inspect_request(&req, &config).is_err());
+    }
+
+    #[test]
+    fn inspect_allows_clean_request() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
@@ -465,6 +616,6 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        assert!(inspect_get_request(&req, &config).is_ok());
+        assert!(inspect_request(&req, &config).is_ok());
     }
 }

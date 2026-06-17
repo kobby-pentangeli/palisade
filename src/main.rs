@@ -6,7 +6,8 @@ use palisade::server::{
     ServerState, serve, shutdown_signal, spawn_health_checker, spawn_rate_limit_cleanup,
 };
 use palisade::{
-    Config, IpRateLimiter, LoadBalancer, UpstreamPool, build_client, build_https_client,
+    AdminState, Config, IpRateLimiter, LoadBalancer, Metrics, UpstreamPool, build_client,
+    build_https_client, serve_admin,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -17,8 +18,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "./Config.yml")]
+    /// Path to the TOML configuration file.
+    #[arg(short, long, default_value = "./config.toml")]
     config: String,
 
     /// Log output format (pretty | json).
@@ -80,7 +81,7 @@ async fn main() {
     });
 
     let upstream_is_https = config.has_https_upstream();
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let rate_limiter = config.rate_limit.as_ref().map(|rl_cfg| {
@@ -89,7 +90,10 @@ async fn main() {
             burst = rl_cfg.burst,
             "per-IP rate limiting enabled"
         );
-        IpRateLimiter::from_config(rl_cfg).expect("rate limiter from config should not fail here")
+        IpRateLimiter::from_config(rl_cfg).unwrap_or_else(|e| {
+            error!(%e, "failed to initialize rate limiter");
+            std::process::exit(1);
+        })
     });
 
     info!(
@@ -105,6 +109,7 @@ async fn main() {
         tls_origination = upstream_is_https,
         active_health_checks = config.health_check.is_some(),
         rate_limiting = rate_limiter.is_some(),
+        admin_endpoints = config.admin_listen.is_some(),
         "configuration loaded"
     );
 
@@ -130,8 +135,12 @@ async fn main() {
     info!(%addr, "listening");
 
     let health_check_handle = config.health_check.as_ref().map(|hc| {
+        let probe_client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(palisade::tls::build_https_connector(config.connect_timeout));
         spawn_health_checker(
             balancer.clone(),
+            probe_client,
             Duration::from_secs(hc.interval),
             &hc.path,
             config.failure_threshold,
@@ -144,13 +153,38 @@ async fn main() {
         .as_ref()
         .map(|rl| spawn_rate_limit_cleanup(rl.clone()));
 
+    let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
+    let metrics = config.admin_listen.map(|_| Arc::new(Metrics::new()));
+
+    let admin_handle = match (config.admin_listen, metrics.as_ref()) {
+        (Some(admin_addr), Some(metrics)) => {
+            let admin_listener = TcpListener::bind(admin_addr).await.unwrap_or_else(|e| {
+                error!(%e, %admin_addr, "failed to bind admin listener");
+                std::process::exit(1);
+            });
+            info!(%admin_addr, "admin endpoints listening");
+            let admin_state = AdminState {
+                metrics: Arc::clone(metrics),
+                balancer: balancer.clone(),
+                request_semaphore: Arc::clone(&semaphore),
+                concurrency_limit,
+                connection_semaphore: Arc::clone(&connection_semaphore),
+                max_connections: config.max_connections,
+            };
+            Some(tokio::spawn(serve_admin(admin_listener, admin_state)))
+        }
+        _ => None,
+    };
+
     let state = ServerState {
         config: Arc::clone(&config),
         balancer,
         semaphore,
         concurrency_limit,
+        connection_semaphore,
         rate_limiter,
         tls_acceptor,
+        metrics,
     };
 
     if upstream_is_https {
@@ -166,6 +200,10 @@ async fn main() {
     }
 
     if let Some(handle) = cleanup_handle {
+        handle.abort();
+    }
+
+    if let Some(handle) = admin_handle {
         handle.abort();
     }
 

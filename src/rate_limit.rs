@@ -39,10 +39,13 @@ impl IpRateLimiter {
     /// The quota is set to `requests_per_second` sustained rate with
     /// `burst` additional tokens available for traffic spikes.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `requests_per_second` or `burst` is zero. These invariants
-    /// are expected to be enforced by configuration validation.
+    /// Returns [`ProxyError::Internal`] if `requests_per_second` or `burst`
+    /// is zero. Configuration loaded through [`Config::into_runtime`] rejects
+    /// these at startup, so this path is unreachable for validated config.
+    ///
+    /// [`Config::into_runtime`]: crate::Config::into_runtime
     pub fn from_config(config: &RateLimitConfig) -> Result<Self> {
         let rps = NonZeroU32::new(config.requests_per_second)
             .ok_or_else(|| ProxyError::Internal("requests_per_second must be non-zero".into()))?;
@@ -63,9 +66,10 @@ impl IpRateLimiter {
     /// with the estimated wait time in milliseconds if the limit is exceeded.
     pub fn check(&self, ip: &IpAddr) -> std::result::Result<(), u64> {
         self.inner.check_key(ip).map_err(|not_until| {
-            not_until
+            let wait_ms = not_until
                 .wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
-                .as_millis() as u64
+                .as_millis();
+            u64::try_from(wait_ms).unwrap_or(u64::MAX)
         })
     }
 

@@ -1,77 +1,88 @@
-//! Weighted round-robin load balancer.
+//! Smooth weighted round-robin load balancer.
 //!
-//! Distributes requests across healthy upstream backends proportionally
-//! to their configured weights. Uses a single [`AtomicUsize`] counter
-//! for lock-free, contention-minimized selection.
+//! Distributes requests across eligible upstream backends proportionally
+//! to their configured weights using the nginx-style interleaving
+//! algorithm: each selection adds every eligible backend's weight to its
+//! running current-weight, picks the backend with the greatest current
+//! weight, and subtracts the eligible total from the winner. This spreads a
+//! heavy backend's selections evenly through the sequence rather than in a
+//! contiguous run, with `O(n_backends)` time and state and no slot
+//! expansion (so a backend with a very large `u32` weight costs nothing
+//! extra).
 //!
-//! The algorithm expands backends into a virtual slot table at construction
-//! time (e.g. a backend with weight 3 occupies three consecutive slots),
-//! then selects a slot by incrementing the counter modulo the table length.
-//! Unhealthy backends are skipped at selection time, falling through to
-//! the next healthy slot.
+//! Selection is lock-free: the running current-weights are held in an array
+//! of [`AtomicI64`] and updated with atomic read-modify-write operations.
+//! Under concurrency the per-request interleaving may deviate slightly from
+//! the strictly sequential order, but selection stays correct, fair on
+//! average, and never blocks. Eligibility (healthy, or an ejected backend
+//! whose cooldown has elapsed) is read from the pool, and the balancer arms the
+//! cooldown as it routes a half-open trial but otherwise never mutates
+//! health state.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::{ProxyError, Result, UpstreamPool, UpstreamState};
 
-/// A weighted round-robin load balancer over an [`UpstreamPool`].
+/// A smooth weighted round-robin load balancer over an [`UpstreamPool`].
 ///
-/// Selection is lock-free and safe to call concurrently from multiple
-/// request handlers. The balancer never modifies backend health state;
-/// it only reads it.
+/// Cheaply cloneable and safe to call concurrently from multiple request
+/// handlers; clones share the same running selection state.
 #[derive(Debug, Clone)]
 pub struct LoadBalancer {
     pool: UpstreamPool,
-    /// Pre-expanded slot table mapping counter positions to backend indices.
-    slots: Arc<Vec<usize>>,
-    /// Monotonic counter incremented on each selection attempt.
-    counter: Arc<AtomicUsize>,
+    /// Per-backend running current-weight, indexed in lockstep with
+    /// [`UpstreamPool::all`]. Oscillates around zero within `+/-total_weight`.
+    current_weights: Arc<Vec<AtomicI64>>,
 }
 
 impl LoadBalancer {
-    /// Creates a new round-robin balancer from the given upstream pool.
-    ///
-    /// Builds a virtual slot table where each backend occupies a number
-    /// of consecutive slots equal to its weight. For example, given
-    /// backends `[A(w=3), B(w=1)]`, the slot table is `[0, 0, 0, 1]`.
+    /// Creates a new smooth weighted round-robin balancer from the pool.
     pub fn new(pool: UpstreamPool) -> Self {
-        let slots = pool
-            .all()
-            .iter()
-            .enumerate()
-            .flat_map(|(idx, backend)| std::iter::repeat_n(idx, backend.weight() as usize))
-            .collect::<Vec<usize>>();
-
+        let current_weights = pool.all().iter().map(|_| AtomicI64::new(0)).collect();
         Self {
             pool,
-            slots: Arc::new(slots),
-            counter: Arc::new(AtomicUsize::new(0)),
+            current_weights: Arc::new(current_weights),
         }
     }
 
-    /// Selects the next healthy upstream backend.
+    /// Selects the next eligible upstream backend by smooth weighted
+    /// round-robin.
     ///
-    /// Advances the internal counter and walks through the slot table
-    /// until a healthy backend is found. If no healthy backend exists
-    /// after a full rotation, returns [`ProxyError::NoHealthyUpstream`].
+    /// Returns [`ProxyError::NoHealthyUpstream`] when no backend is eligible.
     pub fn next(&self) -> Result<UpstreamState> {
-        let slots = self.slots.len();
-        if slots == 0 {
-            return Err(ProxyError::NoHealthyUpstream);
-        }
-
-        let start = self.counter.fetch_add(1, Ordering::Relaxed);
         let backends = self.pool.all();
 
-        (0..slots)
-            .map(|offset| {
-                let slot_idx = (start + offset) % slots;
-                &backends[self.slots[slot_idx]]
-            })
-            .find(|backend| backend.is_healthy())
-            .cloned()
-            .ok_or(ProxyError::NoHealthyUpstream)
+        let mut total: i64 = 0;
+        let mut best: Option<usize> = None;
+        let mut best_weight = i64::MIN;
+
+        for (idx, backend) in backends.iter().enumerate() {
+            if !backend.is_eligible() {
+                continue;
+            }
+            let weight = i64::from(backend.weight());
+            total = total.saturating_add(weight);
+            let current = self.current_weights[idx]
+                .fetch_add(weight, Ordering::AcqRel)
+                .saturating_add(weight);
+            if current > best_weight {
+                best_weight = current;
+                best = Some(idx);
+            }
+        }
+
+        match best {
+            Some(idx) => {
+                self.current_weights[idx].fetch_sub(total, Ordering::AcqRel);
+                let selected = &backends[idx];
+                if !selected.is_healthy() {
+                    selected.arm_cooldown();
+                }
+                Ok(selected.clone())
+            }
+            None => Err(ProxyError::NoHealthyUpstream),
+        }
     }
 
     /// Returns a reference to the underlying upstream pool.
@@ -82,10 +93,18 @@ impl LoadBalancer {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::config::ValidatedUpstream;
 
+    const LONG_COOLDOWN: Duration = Duration::from_secs(30);
+
     fn make_pool(specs: &[(&str, u32)]) -> UpstreamPool {
+        make_pool_with_cooldown(specs, LONG_COOLDOWN)
+    }
+
+    fn make_pool_with_cooldown(specs: &[(&str, u32)], cooldown: Duration) -> UpstreamPool {
         let validated = specs
             .iter()
             .map(|(addr, weight)| ValidatedUpstream {
@@ -93,7 +112,7 @@ mod tests {
                 weight: *weight,
             })
             .collect::<Vec<ValidatedUpstream>>();
-        UpstreamPool::from_validated(&validated)
+        UpstreamPool::from_validated(&validated, cooldown)
     }
 
     #[test]
@@ -188,5 +207,32 @@ mod tests {
             selected.uri(),
             &"http://b1:3000".parse::<hyper::Uri>().unwrap()
         );
+    }
+
+    #[test]
+    fn large_weight_does_not_allocate_slot_table() {
+        let pool = make_pool(&[("http://b1:3000", u32::MAX)]);
+        let balancer = LoadBalancer::new(pool);
+
+        for _ in 0..5 {
+            assert_eq!(
+                balancer.next().unwrap().uri(),
+                &"http://b1:3000".parse::<hyper::Uri>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ejected_backend_recovers_after_cooldown() {
+        let pool = make_pool_with_cooldown(&[("http://b1:3000", 1)], Duration::from_millis(20));
+        let balancer = LoadBalancer::new(pool);
+
+        balancer.pool().all()[0].mark_unhealthy();
+        // During cooldown the only backend is ineligible.
+        assert!(balancer.next().is_err());
+
+        std::thread::sleep(Duration::from_millis(40));
+        // Once the cooldown elapses the ejected backend earns a trial.
+        assert!(balancer.next().is_ok());
     }
 }

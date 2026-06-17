@@ -1,0 +1,36 @@
+# cargo-deny configuration. Run locally with `cargo deny check`.
+#
+# CI runs `check advisories bans sources licenses`. Palisade's dependency tree
+# is small and audited; the allow-list below enumerates every license actually
+# present so a new dependency carrying an unreviewed license fails the gate.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[bans]
+# The hyper/tokio/rustls ecosystem occasionally carries a transitive crate at
+# two semver-incompatible versions during upstream migrations; surface these as
+# a warning so they are visible without blocking unrelated work.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CDLA-Permissive-2.0",
+]

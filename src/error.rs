@@ -36,7 +36,7 @@ pub enum ProxyError {
     },
 
     /// The request contains both `Content-Length` and `Transfer-Encoding`,
-    /// indicating a potential HTTP request smuggling attack (RFC 7230 §3.3.3).
+    /// indicating a potential HTTP request smuggling attack (RFC 9112 §6.1).
     #[error("ambiguous request framing: both Content-Length and Transfer-Encoding present")]
     RequestSmuggling,
 

@@ -1,14 +1,16 @@
 //! Configuration loading, validation, and pre-compiled runtime state.
 //!
-//! The proxy reads its YAML configuration exactly once at startup.
+//! The proxy reads its TOML configuration exactly once at startup.
 //! All regex patterns for sensitive data masking are compiled at load time
 //! and stored alongside the raw config for zero-allocation lookups at
 //! request time.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use hyper::header::HeaderName;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,10 @@ use crate::{ProxyError, Result};
 
 /// Default maximum request body size: 10 MiB.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Default ceiling on the response body the proxy will buffer for masking:
+/// 1 MiB. Larger responses stream through unmasked to bound memory use.
+pub const DEFAULT_MASK_MAX_BODY_SIZE: u64 = 1024 * 1024;
 
 /// Default connect timeout for establishing upstream TCP connections.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +38,13 @@ pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
 /// Default maximum number of concurrent in-flight requests the proxy
 /// will handle before returning 503 Service Unavailable.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
+
+/// Default maximum number of simultaneously open client connections.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// Default maximum time the proxy waits for a client to send a complete set
+/// of request headers before closing the connection.
+pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default weight assigned to upstream backends when none is specified.
 pub const DEFAULT_UPSTREAM_WEIGHT: u32 = 1;
@@ -66,7 +79,7 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 50;
 /// Default graceful shutdown drain timeout.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Raw configuration as deserialized from the YAML file.
+/// Raw configuration as deserialized from the TOML file.
 ///
 /// This struct maps directly to the on-disk schema. After loading, it is
 /// transformed into a [`RuntimeConfig`] that holds pre-compiled regex
@@ -89,17 +102,34 @@ pub struct Config {
     #[serde(default)]
     pub masked_params: Vec<String>,
     /// Maximum allowed request body size in bytes (default: 10 MiB).
-    /// Requests with a `Content-Length` exceeding this limit receive 413.
+    /// Enforced on the actual byte count regardless of framing; an
+    /// overflowing request receives 413.
     #[serde(default)]
     pub max_body_size: Option<u64>,
+    /// Maximum response body size in bytes the proxy buffers for masking
+    /// (default: 1 MiB). Responses larger than this stream through unmasked.
+    #[serde(default)]
+    pub mask_max_body_size: Option<u64>,
     /// Response header names to strip before returning to the client.
     /// Typically `["server", "x-powered-by"]` to hide backend details.
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
+    /// Whether to trust client-supplied `X-Forwarded-*` headers
+    /// (default: `false`).
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
     /// Maximum concurrent in-flight requests before returning 503
     /// Service Unavailable (default: 1000).
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+    /// Maximum number of simultaneously open client connections
+    /// (default: 10000). Connections beyond this are dropped at accept time.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Maximum seconds to wait for a client to send complete request headers
+    /// before closing the connection (default: 10).
+    #[serde(default)]
+    pub header_read_timeout: Option<u64>,
     /// Timeout configuration for upstream connections and requests.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
@@ -117,6 +147,10 @@ pub struct Config {
     /// disabled.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Administrative listener for metrics and health probes. When absent,
+    /// the admin server is disabled.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
     /// Graceful shutdown drain timeout in seconds (default: 30).
     /// After signal receipt, in-flight requests have this long to complete
     /// before the proxy forcibly terminates them.
@@ -137,10 +171,6 @@ pub struct TimeoutsConfig {
     /// (default: 30). Requests exceeding this receive 504.
     #[serde(default = "default_request_timeout_secs")]
     pub request: u64,
-    /// Idle timeout in seconds for pooled upstream connections
-    /// (default: 60).
-    #[serde(default = "default_idle_timeout_secs")]
-    pub idle: u64,
 }
 
 fn default_connect_timeout_secs() -> u64 {
@@ -151,16 +181,11 @@ fn default_request_timeout_secs() -> u64 {
     DEFAULT_REQUEST_TIMEOUT.as_secs()
 }
 
-fn default_idle_timeout_secs() -> u64 {
-    DEFAULT_POOL_IDLE_TIMEOUT.as_secs()
-}
-
 impl Default for TimeoutsConfig {
     fn default() -> Self {
         Self {
             connect: default_connect_timeout_secs(),
             request: default_request_timeout_secs(),
-            idle: default_idle_timeout_secs(),
         }
     }
 }
@@ -322,6 +347,17 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+/// Administrative listener configuration.
+///
+/// When present, the proxy exposes Prometheus metrics and liveness/readiness
+/// probes on a dedicated bind address, kept separate from the data-plane
+/// listener so operational endpoints are never reachable by proxy clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminConfig {
+    /// Socket address the admin listener binds to (e.g. `"127.0.0.1:9090"`).
+    pub listen: String,
+}
+
 /// Validated upstream backend descriptor produced from [`UpstreamConfig`].
 #[derive(Debug, Clone)]
 pub struct ValidatedUpstream {
@@ -342,18 +378,24 @@ pub struct RuntimeConfig {
     pub listen: SocketAddr,
     /// Validated upstream backends with their load-balancing weights.
     pub upstreams: Vec<ValidatedUpstream>,
-    /// Lowercased header names whose presence triggers a 403 on GET requests.
-    pub blocked_headers: Vec<String>,
+    /// Pre-parsed header names whose presence triggers a 403 on GET requests.
+    pub blocked_headers: Vec<HeaderName>,
     /// Query parameter names whose presence triggers a 403 on GET requests.
     pub blocked_params: Vec<String>,
     /// Pre-compiled masking rules for response body inspection.
     pub mask_rules: Vec<MaskRule>,
-    /// Maximum request body size in bytes. Requests whose `Content-Length`
-    /// exceeds this threshold are rejected with 413 Payload Too Large.
+    /// Maximum request body size in bytes, enforced on the actual byte count.
+    /// Requests whose body exceeds this threshold are rejected with 413.
     pub max_body_size: u64,
+    /// Maximum response body size in bytes the proxy buffers for masking.
+    /// Responses larger than this are streamed through unmasked.
+    pub mask_max_body_size: u64,
     /// Lowercased response header names to strip before returning to the
     /// client (e.g. `"server"`, `"x-powered-by"`).
     pub strip_response_headers: Vec<String>,
+    /// Whether client-supplied `X-Forwarded-*` headers are trusted
+    /// (default: `false`).
+    pub trust_forwarded_headers: bool,
     /// Connect timeout for upstream TCP connections.
     pub connect_timeout: Duration,
     /// Total request timeout for the upstream round-trip. Expiry yields 504.
@@ -364,6 +406,11 @@ pub struct RuntimeConfig {
     pub pool_max_idle_per_host: usize,
     /// Maximum concurrent in-flight requests. Overflow yields 503.
     pub max_concurrent_requests: usize,
+    /// Maximum number of simultaneously open client connections. New
+    /// connections beyond this ceiling are dropped at accept time.
+    pub max_connections: usize,
+    /// Maximum time to wait for a client to send complete request headers.
+    pub header_read_timeout: Duration,
     /// TLS termination configuration. `None` means plain HTTP.
     pub tls: Option<TlsConfig>,
     /// Active health check configuration. `None` disables active probing.
@@ -372,10 +419,16 @@ pub struct RuntimeConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking a backend healthy.
     pub healthy_threshold: u32,
-    /// Cooldown period before re-checking an unhealthy backend.
+    /// Cooldown an ejected backend must wait before it becomes eligible for
+    /// a half-open trial request. Bounds in-flight trial traffic to roughly
+    /// one request per window and lets passive-only deployments recover
+    /// backends without active health checks.
     pub health_check_cooldown: Duration,
     /// Per-IP rate limiting configuration. `None` disables rate limiting.
     pub rate_limit: Option<RateLimitConfig>,
+    /// Admin listener bind address for metrics and health probes. `None`
+    /// disables the admin server.
+    pub admin_listen: Option<SocketAddr>,
     /// Graceful shutdown drain timeout. After signal receipt, in-flight
     /// requests have this long to complete before forced termination.
     pub shutdown_timeout: Duration,
@@ -416,19 +469,19 @@ fn validate_upstream(address: &str, weight: u32) -> Result<ValidatedUpstream> {
 }
 
 impl Config {
-    /// Loads configuration from a YAML file at the given path.
+    /// Loads configuration from a TOML file at the given path.
     ///
-    /// Returns a [`ProxyError::Config`] if the file cannot be opened or
-    /// its contents fail YAML deserialization.
+    /// Returns a [`ProxyError::Config`] if the file cannot be read or
+    /// its contents fail TOML deserialization.
     pub fn load_from_file(file_path: &(impl AsRef<Path> + ?Sized)) -> Result<Self> {
-        let file = std::fs::File::open(file_path).map_err(|e| {
+        let contents = std::fs::read_to_string(file_path).map_err(|e| {
             ProxyError::Config(format!(
-                "failed to open {}: {e}",
+                "failed to read {}: {e}",
                 file_path.as_ref().display()
             ))
         })?;
 
-        serde_yaml::from_reader(file)
+        toml::from_str(&contents)
             .map_err(|e| ProxyError::Config(format!("failed to parse config: {e}")))
     }
 
@@ -454,11 +507,23 @@ impl Config {
             .map(|u| validate_upstream(&u.address, u.weight))
             .collect::<Result<Vec<_>>>()?;
 
+        let mut seen = HashSet::with_capacity(upstreams.len());
+        if let Some(dup) = upstreams.iter().find(|u| !seen.insert(&u.uri)) {
+            return Err(ProxyError::Config(format!(
+                "duplicate upstream address: {}",
+                dup.uri
+            )));
+        }
+
         let blocked_headers = self
             .blocked_headers
-            .into_iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect();
+            .iter()
+            .map(|h| {
+                HeaderName::from_bytes(h.as_bytes()).map_err(|e| {
+                    ProxyError::Config(format!("invalid blocked header name \"{h}\": {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let mask_rules = self
             .masked_params
@@ -478,11 +543,31 @@ impl Config {
 
         let max_body_size = self.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE);
 
+        let mask_max_body_size = self
+            .mask_max_body_size
+            .unwrap_or(DEFAULT_MASK_MAX_BODY_SIZE);
+        if mask_max_body_size == 0 {
+            return Err(ProxyError::Config(
+                "mask_max_body_size must be positive".into(),
+            ));
+        }
+
         let strip_response_headers = self
             .strip_response_headers
             .into_iter()
             .map(|h| h.to_ascii_lowercase())
             .collect();
+
+        if self.timeouts.connect == 0 {
+            return Err(ProxyError::Config(
+                "timeouts.connect must be positive".into(),
+            ));
+        }
+        if self.timeouts.request == 0 {
+            return Err(ProxyError::Config(
+                "timeouts.request must be positive".into(),
+            ));
+        }
 
         let connect_timeout = Duration::from_secs(self.timeouts.connect);
         let request_timeout = Duration::from_secs(self.timeouts.request);
@@ -492,6 +577,69 @@ impl Config {
         let max_concurrent_requests = self
             .max_concurrent_requests
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
+        if max_concurrent_requests == 0 {
+            return Err(ProxyError::Config(
+                "max_concurrent_requests must be positive".into(),
+            ));
+        }
+
+        let max_connections = self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        if max_connections == 0 {
+            return Err(ProxyError::Config(
+                "max_connections must be positive".into(),
+            ));
+        }
+
+        let header_read_timeout = self
+            .header_read_timeout
+            .map_or(DEFAULT_HEADER_READ_TIMEOUT, Duration::from_secs);
+        if header_read_timeout.is_zero() {
+            return Err(ProxyError::Config(
+                "header_read_timeout must be positive".into(),
+            ));
+        }
+
+        if let Some(rl) = self.rate_limit.as_ref() {
+            if rl.requests_per_second == 0 {
+                return Err(ProxyError::Config(
+                    "rate_limit.requests_per_second must be positive".into(),
+                ));
+            }
+            if rl.burst == 0 {
+                return Err(ProxyError::Config(
+                    "rate_limit.burst must be positive".into(),
+                ));
+            }
+        }
+
+        if let Some(hc) = self.health_check.as_ref() {
+            if hc.unhealthy_threshold == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.unhealthy_threshold must be positive".into(),
+                ));
+            }
+            if hc.healthy_threshold == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.healthy_threshold must be positive".into(),
+                ));
+            }
+            if hc.interval == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.interval must be positive".into(),
+                ));
+            }
+            if hc.timeout == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.timeout must be positive".into(),
+                ));
+            }
+            if !hc.path.starts_with('/') {
+                return Err(ProxyError::Config(format!(
+                    "health_check.path must begin with '/': \"{}\"",
+                    hc.path
+                )));
+            }
+        }
 
         let failure_threshold = self
             .health_check
@@ -510,6 +658,24 @@ impl Config {
                 Duration::from_secs(hc.cooldown)
             });
 
+        let admin_listen = self
+            .admin
+            .as_ref()
+            .map(|a| {
+                a.listen.parse::<SocketAddr>().map_err(|e| {
+                    ProxyError::Config(format!(
+                        "invalid admin listen address \"{}\": {e}",
+                        a.listen
+                    ))
+                })
+            })
+            .transpose()?;
+        if admin_listen == Some(listen) {
+            return Err(ProxyError::Config(
+                "admin.listen must differ from the data-plane listen address".into(),
+            ));
+        }
+
         let shutdown_timeout = self
             .shutdown_timeout
             .map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_secs);
@@ -521,18 +687,23 @@ impl Config {
             blocked_params: self.blocked_params,
             mask_rules,
             max_body_size,
+            mask_max_body_size,
             strip_response_headers,
+            trust_forwarded_headers: self.trust_forwarded_headers,
             connect_timeout,
             request_timeout,
             pool_idle_timeout,
             pool_max_idle_per_host,
             max_concurrent_requests,
+            max_connections,
+            header_read_timeout,
             tls: self.tls,
             health_check: self.health_check,
             failure_threshold,
             healthy_threshold,
             health_check_cooldown,
             rate_limit: self.rate_limit,
+            admin_listen,
             shutdown_timeout,
         })
     }
@@ -575,8 +746,8 @@ mod tests {
 
     #[test]
     fn loads_config_from_file() {
-        let config = Config::load_from_file("./Config.example.yml")
-            .expect("Config.example.yml should be loadable");
+        let config = Config::load_from_file("./config.example.toml")
+            .expect("config.example.toml should be loadable");
 
         assert_eq!(config.listen, Some("127.0.0.1:8100".into()));
         assert_eq!(config.upstreams.len(), 1);
@@ -589,7 +760,6 @@ mod tests {
         assert_eq!(config.masked_params, vec!["password", "ssn", "credit_card"]);
         assert_eq!(config.timeouts.connect, 5);
         assert_eq!(config.timeouts.request, 30);
-        assert_eq!(config.timeouts.idle, 60);
         assert_eq!(config.pool.idle_timeout, 60);
         assert_eq!(config.pool.max_idle_per_host, 32);
         assert_eq!(config.max_concurrent_requests, Some(1000));
@@ -628,7 +798,205 @@ mod tests {
             ..Default::default()
         };
         let rt = config.into_runtime().expect("valid config");
-        assert_eq!(rt.blocked_headers, vec!["x-custom-header"]);
+        assert_eq!(
+            rt.blocked_headers,
+            vec![HeaderName::from_static("x-custom-header")]
+        );
+    }
+
+    #[test]
+    fn into_runtime_rejects_invalid_blocked_header_name() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            blocked_headers: vec!["invalid header".into()],
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_duplicate_upstreams() {
+        let config = Config {
+            upstreams: vec![
+                UpstreamConfig {
+                    address: "http://backend:3000".into(),
+                    weight: 1,
+                },
+                UpstreamConfig {
+                    address: "http://backend:3000".into(),
+                    weight: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_max_concurrent_requests() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            max_concurrent_requests: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_max_connections() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            max_connections: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_header_read_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            header_read_timeout: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_mask_max_body_size() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            mask_max_body_size: Some(0),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_applies_resource_limit_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(rt.header_read_timeout, DEFAULT_HEADER_READ_TIMEOUT);
+        assert_eq!(rt.mask_max_body_size, DEFAULT_MASK_MAX_BODY_SIZE);
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_rate_limit_rps() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            rate_limit: Some(RateLimitConfig {
+                requests_per_second: 0,
+                burst: 50,
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_rate_limit_burst() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            rate_limit: Some(RateLimitConfig {
+                requests_per_second: 100,
+                burst: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_thresholds() {
+        let unhealthy = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                unhealthy_threshold: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(unhealthy.into_runtime().is_err());
+
+        let healthy = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                healthy_threshold: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(healthy.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_health_path_without_leading_slash() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                path: "health".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_interval() {
+        // A zero interval would panic `tokio::time::interval` at runtime.
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                interval: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                timeout: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_connect_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            timeouts: TimeoutsConfig {
+                connect: 0,
+                request: 30,
+            },
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_request_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            timeouts: TimeoutsConfig {
+                connect: 5,
+                request: 0,
+            },
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
     }
 
     #[test]
@@ -780,6 +1148,57 @@ mod tests {
     }
 
     #[test]
+    fn into_runtime_parses_admin_listen_when_configured() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            admin: Some(AdminConfig {
+                listen: "127.0.0.1:9090".into(),
+            }),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(
+            rt.admin_listen,
+            Some("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn into_runtime_disables_admin_by_default() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.admin_listen, None);
+    }
+
+    #[test]
+    fn into_runtime_rejects_admin_listen_sharing_data_plane_address() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            listen: Some("127.0.0.1:8100".into()),
+            admin: Some(AdminConfig {
+                listen: "127.0.0.1:8100".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_invalid_admin_listen() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            admin: Some(AdminConfig {
+                listen: "not-an-address".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
     fn health_check_config_uses_defaults() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
@@ -792,6 +1211,7 @@ mod tests {
         assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
         assert!(rt.health_check.is_some());
         let hc = rt.health_check.as_ref().unwrap();
+        assert_eq!(hc.cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN.as_secs());
         assert_eq!(hc.timeout, DEFAULT_HEALTH_CHECK_TIMEOUT.as_secs());
     }
 
@@ -815,7 +1235,6 @@ mod tests {
             timeouts: TimeoutsConfig {
                 connect: 2,
                 request: 10,
-                idle: 120,
             },
             pool: PoolConfig {
                 idle_timeout: 90,

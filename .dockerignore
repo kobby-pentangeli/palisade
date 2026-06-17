@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+docs/
+deploy/
+tests/
+config.toml
+*.md
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml

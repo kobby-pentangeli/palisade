@@ -7,11 +7,14 @@
 //! - **Termination (client -> proxy):** Accepts HTTPS connections using a
 //!   locally loaded certificate chain and private key.
 //! - **Origination (proxy -> upstream):** Initiates HTTPS connections to
-//!   upstream backends using the platform root certificate store.
+//!   upstream backends, verifying servers against the Mozilla root
+//!   certificate bundle vendored by [`webpki_roots`], not the OS trust store.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
@@ -28,10 +31,14 @@ pub fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     let certs = load_certs(&config.cert_path)?;
     let key = load_private_key(&config.key_path)?;
 
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| ProxyError::Tls(format!("failed to build TLS server config: {e}")))?;
+
+    // Advertise HTTP/2 ahead of HTTP/1.1 so ALPN-capable clients negotiate the
+    // multiplexed protocol while plain HTTP/1.1 clients still connect.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -41,8 +48,14 @@ pub fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 /// Uses the Mozilla root certificate store via [`webpki_roots`] for server
 /// verification. The resulting connector supports both `http://` and
 /// `https://` schemes; plain HTTP connections pass through unmodified.
-pub fn build_https_connector()
--> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
+/// For `https://` upstreams it negotiates HTTP/2 or HTTP/1.1 over ALPN,
+/// allowing the proxy to multiplex requests to backends that support it.
+///
+/// `connect_timeout` bounds the TCP connect phase of every upstream
+/// connection the resulting connector establishes.
+pub fn build_https_connector(
+    connect_timeout: Duration,
+) -> hyper_rustls::HttpsConnector<HttpConnector> {
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -50,11 +63,15 @@ pub fn build_https_connector()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
+    let mut http = HttpConnector::new();
+    http.set_connect_timeout(Some(connect_timeout));
+    http.enforce_http(false);
+
     HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
-        .enable_http1()
-        .build()
+        .enable_all_versions()
+        .wrap_connector(http)
 }
 
 /// Loads PEM-encoded X.509 certificates from the file at `path`.

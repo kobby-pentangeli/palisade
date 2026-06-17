@@ -41,7 +41,7 @@ async fn requests_distributed_across_multiple_backends() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let mut bodies = Vec::new();
@@ -58,6 +58,7 @@ async fn requests_distributed_across_multiple_backends() {
             config.clone(),
             balancer.clone(),
             test_addr(),
+            false,
             None,
         )
         .await
@@ -104,7 +105,7 @@ async fn weighted_distribution_sends_more_to_heavier_backend() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let mut heavy_count = 0u32;
@@ -123,6 +124,7 @@ async fn weighted_distribution_sends_more_to_heavier_backend() {
             config.clone(),
             balancer.clone(),
             test_addr(),
+            false,
             None,
         )
         .await
@@ -170,7 +172,7 @@ async fn unhealthy_backend_is_skipped() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     // Pre-mark the bad backend as unhealthy so all requests hit the good one.
@@ -189,6 +191,7 @@ async fn unhealthy_backend_is_skipped() {
             config.clone(),
             balancer.clone(),
             test_addr(),
+            false,
             None,
         )
         .await
@@ -221,7 +224,7 @@ async fn all_backends_unhealthy_returns_503() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     balancer.pool().all()[0].mark_unhealthy();
@@ -233,9 +236,17 @@ async fn all_backends_unhealthy_returns_503() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let err = handle_request(req, test_client(), config, balancer, test_addr(), None)
-        .await
-        .unwrap_err();
+    let err = handle_request(
+        req,
+        test_client(),
+        config,
+        balancer,
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap_err();
     let resp = err.into_response();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -265,7 +276,7 @@ async fn recovered_backend_receives_traffic_again() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     // Mark backend-1 unhealthy.
@@ -283,6 +294,7 @@ async fn recovered_backend_receives_traffic_again() {
         config.clone(),
         balancer.clone(),
         test_addr(),
+        false,
         None,
     )
     .await
@@ -308,6 +320,7 @@ async fn recovered_backend_receives_traffic_again() {
             config.clone(),
             balancer.clone(),
             test_addr(),
+            false,
             None,
         )
         .await
@@ -341,7 +354,7 @@ async fn single_upstream_routes_all_traffic() {
         .expect("test config"),
     );
 
-    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let pool = UpstreamPool::from_validated(&config.upstreams, config.health_check_cooldown);
     let balancer = LoadBalancer::new(pool);
 
     let req = Request::builder()
@@ -350,9 +363,17 @@ async fn single_upstream_routes_all_traffic() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, balancer, test_addr(), None)
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config,
+        balancer,
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("single"));
