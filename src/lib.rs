@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! Load a YAML configuration, build an HTTP client, and forward a single
+//! Load a TOML configuration, build an HTTP client, and forward a single
 //! request programmatically:
 //!
 //! ```rust,no_run
@@ -28,7 +28,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let config = Config::load_from_file("Config.yml")
+//!     let config = Config::load_from_file("Config.toml")
 //!         .and_then(|c| c.into_runtime())
 //!         .expect("valid configuration");
 //!

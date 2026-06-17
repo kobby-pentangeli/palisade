@@ -1,6 +1,6 @@
 //! Configuration loading, validation, and pre-compiled runtime state.
 //!
-//! The proxy reads its YAML configuration exactly once at startup.
+//! The proxy reads its TOML configuration exactly once at startup.
 //! All regex patterns for sensitive data masking are compiled at load time
 //! and stored alongside the raw config for zero-allocation lookups at
 //! request time.
@@ -79,7 +79,7 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 50;
 /// Default graceful shutdown drain timeout.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Raw configuration as deserialized from the YAML file.
+/// Raw configuration as deserialized from the TOML file.
 ///
 /// This struct maps directly to the on-disk schema. After loading, it is
 /// transformed into a [`RuntimeConfig`] that holds pre-compiled regex
@@ -451,19 +451,19 @@ fn validate_upstream(address: &str, weight: u32) -> Result<ValidatedUpstream> {
 }
 
 impl Config {
-    /// Loads configuration from a YAML file at the given path.
+    /// Loads configuration from a TOML file at the given path.
     ///
-    /// Returns a [`ProxyError::Config`] if the file cannot be opened or
-    /// its contents fail YAML deserialization.
+    /// Returns a [`ProxyError::Config`] if the file cannot be read or
+    /// its contents fail TOML deserialization.
     pub fn load_from_file(file_path: &(impl AsRef<Path> + ?Sized)) -> Result<Self> {
-        let file = std::fs::File::open(file_path).map_err(|e| {
+        let contents = std::fs::read_to_string(file_path).map_err(|e| {
             ProxyError::Config(format!(
-                "failed to open {}: {e}",
+                "failed to read {}: {e}",
                 file_path.as_ref().display()
             ))
         })?;
 
-        serde_yaml::from_reader(file)
+        toml::from_str(&contents)
             .map_err(|e| ProxyError::Config(format!("failed to parse config: {e}")))
     }
 
@@ -688,8 +688,8 @@ mod tests {
 
     #[test]
     fn loads_config_from_file() {
-        let config = Config::load_from_file("./Config.example.yml")
-            .expect("Config.example.yml should be loadable");
+        let config = Config::load_from_file("./Config.example.toml")
+            .expect("Config.example.toml should be loadable");
 
         assert_eq!(config.listen, Some("127.0.0.1:8100".into()));
         assert_eq!(config.upstreams.len(), 1);

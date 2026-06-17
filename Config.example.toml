@@ -1,0 +1,30 @@
+listen = "127.0.0.1:8100"
+
+blocked_headers = ["X-Debug-Token", "X-Internal-Auth"]
+blocked_params = ["access_token", "secret_key"]
+masked_params = ["password", "ssn", "credit_card"]
+
+max_body_size = 10485760
+mask_max_body_size = 1048576
+strip_response_headers = ["server", "x-powered-by"]
+trust_forwarded_headers = false
+
+max_concurrent_requests = 1000
+max_connections = 10000
+header_read_timeout = 10
+
+[[upstreams]]
+address = "http://localhost:3000"
+weight = 1
+
+[timeouts]
+connect = 5
+request = 30
+
+[pool]
+idle_timeout = 60
+max_idle_per_host = 32
+
+[rate_limit]
+requests_per_second = 100
+burst = 50

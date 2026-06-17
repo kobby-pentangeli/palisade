@@ -34,11 +34,11 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 ```bash
 git clone https://github.com/kobby-pentangeli/palisade.git
 cd palisade
-cp Config.example.yml Config.yml   # create your local config
+cp Config.example.toml Config.toml   # create your local config
 cargo build --release
 ```
 
-Edit `Config.yml` to point at your backend(s), then start the proxy:
+Edit `Config.toml` to point at your backend(s), then start the proxy:
 
 ```bash
 cargo run --release
@@ -74,7 +74,7 @@ curl -si http://127.0.0.1:8100/ | grep -i x-request-id
 palisade [OPTIONS]
 
 Options:
-  -c, --config <PATH>        Path to YAML config file [default: ./Config.yml]
+  -c, --config <PATH>        Path to TOML config file [default: ./Config.toml]
       --log-format <FORMAT>  Log output format: pretty | json [default: pretty]
       --log-level <LEVEL>    Log verbosity, overrides RUST_LOG [e.g. debug, info]
   -h, --help                 Print help
@@ -83,71 +83,61 @@ Options:
 
 ## Configuration
 
-All configuration lives in a single YAML file. Below is a complete example with defaults shown:
+All configuration lives in a single TOML file. Below is a complete example with defaults shown:
 
-```yaml
-listen: "127.0.0.1:8100"
+```toml
+listen = "127.0.0.1:8100"
 
-upstreams:
-  - address: "http://localhost:3000"
-    weight: 1
-  - address: "http://localhost:3001"
-    weight: 2
+max_concurrent_requests = 1000
+max_connections = 10000          # simultaneously open client connections
+header_read_timeout = 10         # seconds to read full request headers
+max_body_size = 10485760         # 10 MiB, enforced on actual bytes
+mask_max_body_size = 1048576     # 1 MiB; larger responses stream unmasked
+shutdown_timeout = 30            # seconds
 
-timeouts:
-  connect: 5       # seconds
-  request: 30      # seconds
+blocked_headers = ["X-Debug-Token", "X-Internal-Auth"]
+blocked_params = ["access_token", "secret_key"]
+masked_params = ["password", "ssn", "credit_card"]
+strip_response_headers = ["server", "x-powered-by"]
 
-pool:
-  idle_timeout: 60       # seconds  (idle timeout for pooled upstream connections)
-  max_idle_per_host: 32
+# replace X-Forwarded-For/Proto unless behind a trusted proxy
+trust_forwarded_headers = false
 
-max_concurrent_requests: 1000
-max_connections: 10000          # simultaneously open client connections
-header_read_timeout: 10         # seconds to read full request headers
-max_body_size: 10485760         # 10 MiB, enforced on actual bytes
-mask_max_body_size: 1048576     # 1 MiB; larger responses stream unmasked
+[[upstreams]]
+address = "http://localhost:3000"
+weight = 1
 
-blocked_headers:
-  - X-Debug-Token
-  - X-Internal-Auth
+[[upstreams]]
+address = "http://localhost:3001"
+weight = 2
 
-blocked_params:
-  - access_token
-  - secret_key
+[timeouts]
+connect = 5                      # seconds
+request = 30                     # seconds
 
-masked_params:
-  - password
-  - ssn
-  - credit_card
+[pool]
+idle_timeout = 60                # seconds (idle timeout for pooled upstream connections)
+max_idle_per_host = 32
 
-strip_response_headers:
-  - server
-  - x-powered-by
+[health_check]
+path = "/health"
+interval = 10                    # seconds
+unhealthy_threshold = 3
+healthy_threshold = 1
+cooldown = 30                    # seconds
+timeout = 3                      # seconds
 
-trust_forwarded_headers: false  # replace X-Forwarded-For/Proto unless behind a trusted proxy
-
-health_check:
-  path: /health
-  interval: 10            # seconds
-  unhealthy_threshold: 3
-  healthy_threshold: 1
-  cooldown: 30            # seconds
-  timeout: 3              # seconds
-
-rate_limit:
-  requests_per_second: 100
-  burst: 50
-
-shutdown_timeout: 30  # seconds
+[rate_limit]
+requests_per_second = 100
+burst = 50
 
 # TLS termination (optional)
-# tls:
-#   cert_path: /path/to/cert.pem
-#   key_path: /path/to/key.pem
+# [tls]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
 ```
 
-All time values are in **seconds**. Only `listen` and `upstreams` are required; everything else has sensible defaults.
+All time values are in **seconds**. Only `listen` and `upstreams` are required; everything else has sensible defaults. In TOML, all top-level keys must precede the `[section]` and `[[upstreams]]` tables.
 
 ## Development
 

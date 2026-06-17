@@ -17,8 +17,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "./Config.yml")]
+    /// Path to the TOML configuration file.
+    #[arg(short, long, default_value = "./Config.toml")]
     config: String,
 
     /// Log output format (pretty | json).
