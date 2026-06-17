@@ -1,9 +1,8 @@
 # palisade
 
-[![Crates.io](https://img.shields.io/crates/v/palisade.svg)](https://crates.io/crates/palisade)
-[![Documentation](https://docs.rs/palisade/badge.svg)](https://docs.rs/palisade)
 [![CI](https://github.com/kobby-pentangeli/palisade/workflows/CI/badge.svg)](https://github.com/kobby-pentangeli/palisade/actions)
-[![License](https://img.shields.io/crates/l/palisade.svg)](https://github.com/kobby-pentangeli/palisade#license)
+[![Release](https://img.shields.io/github/v/release/kobby-pentangeli/palisade?sort=semver)](https://github.com/kobby-pentangeli/palisade/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio.rs/), and [rustls](https://docs.rs/rustls). Distributes traffic across weighted upstream backends with active and passive health checks, enforces request policies (header/parameter blocking, body size limits, sensitive data masking), and terminates TLS---all with streaming I/O and zero per-request allocation for config lookups.
 
@@ -24,6 +23,28 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 - *Prometheus metrics and liveness/readiness probes* on a separate admin listener (off by default)
 - *Request correlation* via `X-Request-Id`: a validated inbound id is propagated, otherwise a monotonic one is assigned
 
+## Architecture
+
+Palisade is a single-process, streaming, lock-free-on-the-hot-path reverse proxy. Every inbound request flows through one pipeline:
+
+```text
+client → [TLS termination] → accept loop (connection + concurrency bounds)
+       → rate limit → smuggling defense → body-size limit → policy (header/param)
+       → balancer (smooth weighted round-robin over healthy upstreams)
+       → hop-by-hop strip → forwarding headers → host/URI rewrite
+       → upstream (HTTP/1.1 or HTTP/2, optional TLS origination)
+       → response: hop-by-hop strip → header strip → bounded masking → X-Request-Id
+```
+
+The design holds to a few commitments:
+
+- **Streaming, not buffering.** Request and response bodies flow through without being collected into memory; the sole exception, response masking, is explicitly bounded by `mask_max_body_size`.
+- **Zero per-request allocation for config lookups.** The hot path reads an immutable `RuntimeConfig` built once at startup: masking regexes are pre-compiled and blocked header names pre-parsed.
+- **Lock-free health and selection.** Backend health is tracked with atomics and selection uses atomic running weights; there is no mutex on the request path.
+- **Fail closed at load.** Every configuration invariant is validated at startup and surfaced as an error, so the process refuses to start on bad config rather than panicking on a request.
+
+For the module layout see the [Development Guide](./docs/development.md); for the trust boundary see [SECURITY.md](./SECURITY.md).
+
 ## Quick Start
 
 ### Prerequisites
@@ -35,11 +56,11 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 ```bash
 git clone https://github.com/kobby-pentangeli/palisade.git
 cd palisade
-cp Config.example.toml Config.toml   # create your local config
+cp config.example.toml config.toml   # create your local config
 cargo build --release
 ```
 
-Edit `Config.toml` to point at your backend(s), then start the proxy:
+Edit `config.toml` to point at your backend(s), then start the proxy:
 
 ```bash
 cargo run --release
@@ -75,7 +96,7 @@ curl -si http://127.0.0.1:8100/ | grep -i x-request-id
 palisade [OPTIONS]
 
 Options:
-  -c, --config <PATH>        Path to TOML config file [default: ./Config.toml]
+  -c, --config <PATH>        Path to TOML config file [default: ./config.toml]
       --log-format <FORMAT>  Log output format: pretty | json [default: pretty]
       --log-level <LEVEL>    Log verbosity, overrides RUST_LOG [e.g. debug, info]
   -h, --help                 Print help
@@ -155,7 +176,20 @@ When an `[admin]` listener is configured, the proxy serves operational endpoints
 
 Every response carries an `X-Request-Id`. A well-formed inbound `X-Request-Id` is propagated for end-to-end correlation, otherwise the proxy assigns a monotonic per-process id.
 
+## Deployment
+
+A multi-stage [`Dockerfile`](./Dockerfile) builds a small distroless image, and a [`docker-compose.yml`](./docker-compose.yml) runs the proxy in front of a demo echo backend:
+
+```bash
+docker compose up --build
+curl -i http://localhost:8100/
+```
+
+A hardened [`systemd` unit](./deploy/palisade.service) is provided for bare-metal hosts. See the [Deployment Guide](./deploy/README.md) for the container image, the compose demo, systemd installation, and operational guidance (health gating, metrics scraping, TLS, graceful shutdown).
+
 ## Development
+
+For toolchains, the project layout, and the test organization, see the [Development Guide](./docs/development.md). The canonical dev commands are:
 
 ```bash
 cargo build                                                # debug build
@@ -164,6 +198,10 @@ cargo +nightly fmt                                         # format
 cargo clippy --all-features --all-targets -- -D warnings   # lint
 cargo build --release --all-features --all-targets         # release build
 ```
+
+## Security
+
+Palisade is the trust boundary between untrusted clients and trusted upstreams: it validates configuration at load, enforces request policy on every method, defends against request smuggling and slow-header/oversized-body attacks, and does not trust client-supplied forwarding headers by default. See [SECURITY.md](./SECURITY.md) for the full threat model, what is out of scope, and how to report a vulnerability.
 
 ## Contributing
 
