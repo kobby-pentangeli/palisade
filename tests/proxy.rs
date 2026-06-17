@@ -315,11 +315,9 @@ async fn response_body_masking_replaces_sensitive_params() {
     .await
     .unwrap();
     let body = collect_body(resp.into_body()).await;
-    let body_str = String::from_utf8_lossy(&body);
 
-    assert!(body_str.contains("password=****"));
-    assert!(body_str.contains("ssn=****"));
-    assert!(body_str.contains("user=alice"));
+    // Only the configured params are masked; surrounding fields are untouched.
+    assert_eq!(body, Bytes::from("user=alice&password=****&ssn=****"));
 }
 
 #[tokio::test]
@@ -531,6 +529,40 @@ async fn response_above_masking_ceiling_streams_unmasked() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("password=secret123"));
+}
+
+#[tokio::test]
+async fn content_encoded_response_is_not_masked() {
+    init_tracing();
+    // A compressed text response within the masking ceiling: the proxy must
+    // not decode it as text to mask, which would corrupt the body.
+    let (addr, _shutdown) = start_encoded_backend("text/plain", "gzip", "password=secret123").await;
+    let config = test_config_with_mask_ceiling(addr, 1024);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = collect_body(resp.into_body()).await;
+    assert_eq!(
+        body,
+        Bytes::from("password=secret123"),
+        "a content-encoded body must pass through byte-for-byte, never masked"
+    );
 }
 
 #[tokio::test]

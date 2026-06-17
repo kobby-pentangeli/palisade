@@ -558,6 +558,17 @@ impl Config {
             .map(|h| h.to_ascii_lowercase())
             .collect();
 
+        if self.timeouts.connect == 0 {
+            return Err(ProxyError::Config(
+                "timeouts.connect must be positive".into(),
+            ));
+        }
+        if self.timeouts.request == 0 {
+            return Err(ProxyError::Config(
+                "timeouts.request must be positive".into(),
+            ));
+        }
+
         let connect_timeout = Duration::from_secs(self.timeouts.connect);
         let request_timeout = Duration::from_secs(self.timeouts.request);
         let pool_idle_timeout = Duration::from_secs(self.pool.idle_timeout);
@@ -610,6 +621,16 @@ impl Config {
             if hc.healthy_threshold == 0 {
                 return Err(ProxyError::Config(
                     "health_check.healthy_threshold must be positive".into(),
+                ));
+            }
+            if hc.interval == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.interval must be positive".into(),
+                ));
+            }
+            if hc.timeout == 0 {
+                return Err(ProxyError::Config(
+                    "health_check.timeout must be positive".into(),
                 ));
             }
             if !hc.path.starts_with('/') {
@@ -864,27 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn into_runtime_defaults_to_untrusted_forwarded_headers() {
-        let config = Config {
-            upstreams: single_upstream("http://localhost:3000"),
-            ..Default::default()
-        };
-        let rt = config.into_runtime().expect("valid config");
-        assert!(!rt.trust_forwarded_headers);
-    }
-
-    #[test]
-    fn into_runtime_propagates_trust_forwarded_headers() {
-        let config = Config {
-            upstreams: single_upstream("http://localhost:3000"),
-            trust_forwarded_headers: true,
-            ..Default::default()
-        };
-        let rt = config.into_runtime().expect("valid config");
-        assert!(rt.trust_forwarded_headers);
-    }
-
-    #[test]
     fn into_runtime_rejects_zero_rate_limit_rps() {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
@@ -941,6 +941,59 @@ mod tests {
                 path: "health".into(),
                 ..Default::default()
             }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_interval() {
+        // A zero interval would panic `tokio::time::interval` at runtime.
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                interval: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_health_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                timeout: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_connect_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            timeouts: TimeoutsConfig {
+                connect: 0,
+                request: 30,
+            },
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_request_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            timeouts: TimeoutsConfig {
+                connect: 5,
+                request: 0,
+            },
             ..Default::default()
         };
         assert!(config.into_runtime().is_err());

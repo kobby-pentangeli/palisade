@@ -286,13 +286,13 @@ async fn rate_limit_recovery_after_wait() {
 }
 
 #[tokio::test]
-async fn retain_recent_prunes_stale_entries() {
+async fn retain_recent_preserves_active_entries() {
     let limiter = rate_limiter_from_config(&RateLimitConfig {
         requests_per_second: 100,
         burst: 100,
     });
 
-    // Generate traffic from several IPs.
+    // Generate traffic from several IPs, all touched microseconds ago.
     for i in 1..=5u8 {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
         let _ = limiter.check(&ip);
@@ -300,6 +300,8 @@ async fn retain_recent_prunes_stale_entries() {
 
     assert_eq!(limiter.tracked_ip_count(), 5);
 
+    // Cleanup must keep entries still inside the tracking window; pruning a
+    // freshly-active IP would drop its rate-limit state and let it burst again.
     limiter.retain_recent();
-    assert!(limiter.tracked_ip_count() <= 5);
+    assert_eq!(limiter.tracked_ip_count(), 5);
 }

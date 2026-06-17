@@ -382,12 +382,14 @@ fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
 ///
 /// A response is buffered and scanned for sensitive parameter values only
 /// when masking is configured, its `Content-Type` indicates text or
-/// form-encoded data, and its declared `Content-Length` is within the
-/// configured masking ceiling. Every other response---no masking rules,
-/// non-text content, or a body that is unbounded or larger than the
-/// ceiling---is streamed through unmodified so the proxy never buffers an
-/// upstream body unboundedly. The collect is additionally bounded by the
-/// ceiling to guard against an upstream that understates its length.
+/// form-encoded data, it carries no content coding, and its declared
+/// `Content-Length` is within the configured masking ceiling. Every other
+/// response---no masking rules, non-text or content-encoded content, or a
+/// body that is unbounded or larger than the ceiling---is streamed through
+/// unmodified so the proxy never buffers an upstream body unboundedly and
+/// never decodes a compressed body as text. The collect is additionally
+/// bounded by the ceiling to guard against an upstream that understates its
+/// length.
 async fn build_response(
     upstream_resp: Response<Incoming>,
     config: &RuntimeConfig,
@@ -398,6 +400,13 @@ async fn build_response(
         .and_then(|ct| ct.to_str().ok())
         .is_some_and(|ct| ct.contains("text/") || ct.contains("application/x-www-form-urlencoded"));
 
+    let content_encoded = upstream_resp
+        .headers()
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"));
+
     let within_ceiling = upstream_resp
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
@@ -405,7 +414,8 @@ async fn build_response(
         .and_then(|s| s.parse::<u64>().ok())
         .is_some_and(|len| len <= config.mask_max_body_size);
 
-    if config.mask_rules.is_empty() || !maskable_content_type || !within_ceiling {
+    if config.mask_rules.is_empty() || !maskable_content_type || content_encoded || !within_ceiling
+    {
         if !config.mask_rules.is_empty() && maskable_content_type && !within_ceiling {
             debug!(
                 ceiling = config.mask_max_body_size,

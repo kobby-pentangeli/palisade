@@ -209,6 +209,57 @@ pub async fn start_backend(
     (addr, tx)
 }
 
+/// Starts a local HTTP server that answers every request with the given
+/// status and body, tagged with both a `Content-Type` and a `Content-Encoding`
+/// header. Used to verify the proxy never decodes a content-encoded body as
+/// text for masking.
+pub async fn start_encoded_backend(
+    content_type: &'static str,
+    content_encoding: &'static str,
+    body: &'static str,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut shutdown = std::pin::pin!(async {
+            let _ = rx.await;
+        });
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(move |_req: Request<Incoming>| {
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", content_type)
+                                    .header("content-encoding", content_encoding)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("test response must build"),
+                            )
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
+    });
+
+    (addr, tx)
+}
+
 /// Starts a local backend that captures and echoes request headers as the
 /// response body. Used to verify that the proxy correctly transforms headers.
 pub async fn start_echo_headers_backend() -> (SocketAddr, oneshot::Sender<()>) {
