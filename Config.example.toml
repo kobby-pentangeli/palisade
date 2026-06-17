@@ -28,3 +28,8 @@ max_idle_per_host = 32
 [rate_limit]
 requests_per_second = 100
 burst = 50
+
+# Metrics and liveness/readiness probes on a separate listener (off by default).
+# Must differ from the data-plane `listen` address.
+# [admin]
+# listen = "127.0.0.1:9090"

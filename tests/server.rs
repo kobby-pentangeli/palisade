@@ -30,14 +30,17 @@ async fn spawn_proxy(config: Config) -> (SocketAddr, oneshot::Sender<()>) {
     let balancer = test_balancer(&config);
     let concurrency_limit = config.max_concurrent_requests;
     let semaphore = Arc::new(Semaphore::new(concurrency_limit));
+    let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
 
     let state = ServerState {
         config: Arc::clone(&config),
         balancer,
         semaphore,
         concurrency_limit,
+        connection_semaphore,
         rate_limiter: None,
         tls_acceptor: None,
+        metrics: None,
     };
 
     let (tx, rx) = oneshot::channel::<()>();

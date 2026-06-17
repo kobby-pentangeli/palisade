@@ -8,10 +8,17 @@
 //! configurable timeouts, connection pool tuning, concurrency limiting,
 //! per-IP rate limiting, and graceful shutdown.
 //!
-//! Every inbound request is assigned a monotonic request ID, injected
-//! into the response as an `X-Request-Id` header, and wrapped in a
-//! [`tracing::Span`] carrying the request method, URI, and client
-//! address as structured fields.
+//! Production observability is served on a separate admin listener
+//! ([`serve_admin`]): Prometheus metrics ([`Metrics`]) at `/metrics`, plus
+//! liveness and readiness probes. The admin bind address is kept distinct
+//! from the data-plane listener so operational endpoints are never reachable
+//! by proxy clients.
+//!
+//! Every inbound request is assigned a request ID---a validated inbound
+//! `X-Request-Id` when the client supplies one, otherwise a monotonic
+//! per-process counter---injected into the response as an `X-Request-Id`
+//! header, and wrapped in a [`tracing::Span`] carrying the request method,
+//! URI, and client address as structured fields.
 //!
 //! # Example
 //!
@@ -63,22 +70,26 @@
 //! [rustls]: https://docs.rs/rustls
 //! [tracing]: https://docs.rs/tracing
 
+pub mod admin;
 pub mod balancer;
 pub mod config;
 pub mod error;
 pub mod headers;
+pub mod metrics;
 pub mod proxy;
 pub mod rate_limit;
 pub mod server;
 pub mod tls;
 pub mod upstream;
 
+pub use admin::{AdminState, serve_admin};
 pub use balancer::LoadBalancer;
 pub use config::{
-    Config, HealthCheckConfig, PoolConfig, RateLimitConfig, RuntimeConfig, TimeoutsConfig,
-    TlsConfig, UpstreamConfig,
+    AdminConfig, Config, HealthCheckConfig, PoolConfig, RateLimitConfig, RuntimeConfig,
+    TimeoutsConfig, TlsConfig, UpstreamConfig,
 };
 pub use error::ProxyError;
+pub use metrics::Metrics;
 pub use proxy::{
     BoxBody, HttpClient, HttpsClient, build_client, build_https_client, handle_request,
 };

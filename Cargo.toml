@@ -34,6 +34,7 @@ hyper-util = { version = "0.1", features = [
     "http2",
     "tokio",
 ] }
+prometheus-client = "0.25"
 regex = "1.12"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

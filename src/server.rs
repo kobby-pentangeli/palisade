@@ -7,9 +7,10 @@
 //! handling or `std::process::exit`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use http_body_util::BodyExt;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use hyper::Response;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -21,7 +22,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::{BoxBody, IpRateLimiter, LoadBalancer, ProxyError, RuntimeConfig, handle_request};
+use crate::{
+    BoxBody, IpRateLimiter, LoadBalancer, Metrics, ProxyError, RuntimeConfig, handle_request,
+};
 
 /// Runtime state shared across the accept loop.
 pub struct ServerState {
@@ -33,10 +36,16 @@ pub struct ServerState {
     pub semaphore: Arc<Semaphore>,
     /// Cached value of the semaphore capacity, used in error messages.
     pub concurrency_limit: usize,
+    /// Bounds the number of simultaneously open client connections. Shared
+    /// with the admin listener so the connection-saturation gauge reflects it.
+    pub connection_semaphore: Arc<Semaphore>,
     /// Per-IP rate limiter. `None` disables rate limiting.
     pub rate_limiter: Option<IpRateLimiter>,
     /// TLS acceptor for client-facing connections. `None` means plain HTTP.
     pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    /// Proxy metrics. `None` when the admin listener is disabled, in which
+    /// case no per-request metrics are recorded.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Accepts connections on `listener`, optionally wrapping each in TLS, and
@@ -65,15 +74,16 @@ pub async fn serve<C>(
         balancer,
         semaphore,
         concurrency_limit,
+        connection_semaphore,
         rate_limiter,
         tls_acceptor,
+        metrics,
     } = state;
 
     let shutdown_timeout = config.shutdown_timeout;
     let max_connections = config.max_connections;
     let header_read_timeout = config.header_read_timeout;
     let client_tls = tls_acceptor.is_some();
-    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
     let graceful = GracefulShutdown::new();
 
@@ -119,6 +129,7 @@ pub async fn serve<C>(
                 let tls_acceptor = tls_acceptor.clone();
                 let balancer = balancer.clone();
                 let rate_limiter = rate_limiter.clone();
+                let metrics = metrics.clone();
                 let builder = builder.clone();
                 let watcher = graceful.watcher();
 
@@ -130,54 +141,47 @@ pub async fn serve<C>(
                         let semaphore = Arc::clone(&semaphore);
                         let balancer = balancer.clone();
                         let rate_limiter = rate_limiter.clone();
+                        let metrics = metrics.clone();
                         async move {
-                            let _permit = match semaphore.try_acquire() {
-                                Ok(permit) => permit,
+                            let started = Instant::now();
+                            let resp = match Arc::clone(&semaphore).try_acquire_owned() {
                                 Err(_) => {
                                     warn!(
                                         limit = concurrency_limit,
                                         "concurrency limit reached, rejecting request"
                                     );
-                                    let err = ProxyError::ServiceUnavailable {
+                                    ProxyError::ServiceUnavailable {
                                         limit: concurrency_limit,
-                                    };
-                                    return Ok::<Response<BoxBody>, std::convert::Infallible>(
-                                        err.into_response().map(|b| {
-                                            b.map_err(
-                                                |never| -> Box<
-                                                    dyn std::error::Error + Send + Sync,
-                                                > {
-                                                    match never {}
-                                                },
-                                            )
-                                            .boxed()
-                                        }),
-                                    );
+                                    }
+                                    .into_response()
+                                    .map(box_error_body)
                                 }
+                                Ok(_permit) => match handle_request(
+                                    req,
+                                    client,
+                                    config,
+                                    balancer,
+                                    client_addr,
+                                    client_tls,
+                                    rate_limiter.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        if let Some(m) = metrics.as_deref() {
+                                            if matches!(e, ProxyError::RateLimited { .. }) {
+                                                m.record_rate_limited();
+                                            }
+                                        }
+                                        e.into_response().map(box_error_body)
+                                    }
+                                },
                             };
 
-                            let resp = handle_request(
-                                req,
-                                client,
-                                config,
-                                balancer,
-                                client_addr,
-                                client_tls,
-                                rate_limiter.as_ref(),
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                e.into_response().map(|b| {
-                                    b.map_err(
-                                        |never| -> Box<
-                                            dyn std::error::Error + Send + Sync,
-                                        > {
-                                            match never {}
-                                        },
-                                    )
-                                    .boxed()
-                                })
-                            });
+                            if let Some(m) = metrics.as_deref() {
+                                m.record_response(resp.status().as_u16(), started.elapsed());
+                            }
                             Ok::<Response<BoxBody>, std::convert::Infallible>(resp)
                         }
                     });
@@ -372,4 +376,11 @@ pub async fn shutdown_signal() {
         ctrl_c.await.expect("failed to listen for Ctrl+C");
         info!("received Ctrl+C, initiating graceful shutdown");
     }
+}
+
+/// Boxes the infallible `Full<Bytes>` body produced by an error response into
+/// the proxy's unified [`BoxBody`].
+fn box_error_body(body: Full<Bytes>) -> BoxBody {
+    body.map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed()
 }

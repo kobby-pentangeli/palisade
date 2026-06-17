@@ -923,6 +923,78 @@ async fn response_includes_x_request_id() {
 }
 
 #[tokio::test]
+async fn propagates_valid_inbound_x_request_id() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .header("x-request-id", "trace-abc-123")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.headers().get("x-request-id").unwrap(),
+        "trace-abc-123",
+        "a well-formed inbound correlation id must be echoed unchanged"
+    );
+}
+
+#[tokio::test]
+async fn malformed_inbound_x_request_id_falls_back_to_counter() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+    let config = test_config(addr);
+
+    // A 200-character id exceeds the accepted length bound and is rejected.
+    let oversized = "x".repeat(200);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .header("x-request-id", oversized.clone())
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let echoed = resp
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_ne!(echoed, oversized, "an oversized id must not be propagated");
+    assert!(
+        echoed.parse::<u64>().is_ok(),
+        "a rejected id must fall back to the numeric counter"
+    );
+}
+
+#[tokio::test]
 async fn x_request_id_increments_across_requests() {
     init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;

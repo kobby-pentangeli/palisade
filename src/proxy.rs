@@ -5,9 +5,10 @@
 //! defense) and policy enforcement (header/param blocking, body size
 //! limits, response masking, load balancing).
 //!
-//! Every inbound request is assigned a monotonically increasing request ID
-//! and wrapped in a [`tracing::Span`] carrying structured fields for
-//! observability.
+//! Every inbound request is assigned a request ID---a validated inbound
+//! `X-Request-Id` when the client supplies one, otherwise a monotonic
+//! per-process counter---and wrapped in a [`tracing::Span`] carrying
+//! structured fields for observability.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +26,10 @@ use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::{IpRateLimiter, LoadBalancer, ProxyError, Result, RuntimeConfig, headers, tls};
+
+/// Maximum accepted length of an inbound `X-Request-Id`. Bounds the value the
+/// proxy echoes and logs, defending against oversized or log-injecting ids.
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
 type StdError = Box<dyn std::error::Error + Send + Sync>;
@@ -114,9 +119,9 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///     configured masking ceiling, sensitive parameter values are masked
 ///     before returning to the client; larger or unbounded responses stream
 ///     through unmasked rather than being buffered.
-/// 15. **Request ID injection** — An `X-Request-Id` header carrying the
-///     monotonic request ID is added to every response for client-side
-///     log correlation.
+/// 15. **Request ID injection** — An `X-Request-Id` header is added to every
+///     response for client-side log correlation: a validated inbound id is
+///     propagated when present, otherwise the monotonic per-process id is used.
 pub async fn handle_request<B, C>(
     req: Request<B>,
     client: Client<C, BoxBody>,
@@ -131,13 +136,14 @@ where
     B::Error: Into<StdError>,
     C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
 {
-    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let seq = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let request_id = inbound_request_id(req.headers()).unwrap_or_else(|| seq.to_string());
     let method = req.method().clone();
     let uri = req.uri().clone();
 
     let span = tracing::info_span!(
         "request",
-        id = request_id,
+        id = %request_id,
         method = %method,
         uri = %uri,
         client = %client_addr,
@@ -281,14 +287,31 @@ where
         }
 
         let mut resp = build_response(upstream_resp, &config).await?;
-        resp.headers_mut().insert(
-            HeaderName::from_static("x-request-id"),
-            hyper::header::HeaderValue::from(request_id),
-        );
+        let id_value = hyper::header::HeaderValue::from_str(&request_id)
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from(seq));
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), id_value);
         Ok(resp)
     }
     .instrument(span)
     .await
+}
+
+/// Extracts a client-supplied `X-Request-Id` to propagate, if present and
+/// well-formed. Accepts a non-empty, length-bounded value of visible ASCII
+/// characters; anything else is rejected so the proxy falls back to its own
+/// monotonic identifier.
+fn inbound_request_id(headers: &hyper::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_REQUEST_ID_LEN
+                && id.bytes().all(|b| b.is_ascii_graphic())
+        })
+        .map(str::to_owned)
 }
 
 /// Checks a request against configured block rules, regardless of method.

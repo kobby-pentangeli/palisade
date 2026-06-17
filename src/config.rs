@@ -147,6 +147,10 @@ pub struct Config {
     /// disabled.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Administrative listener for metrics and health probes. When absent,
+    /// the admin server is disabled.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
     /// Graceful shutdown drain timeout in seconds (default: 30).
     /// After signal receipt, in-flight requests have this long to complete
     /// before the proxy forcibly terminates them.
@@ -343,6 +347,17 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+/// Administrative listener configuration.
+///
+/// When present, the proxy exposes Prometheus metrics and liveness/readiness
+/// probes on a dedicated bind address, kept separate from the data-plane
+/// listener so operational endpoints are never reachable by proxy clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminConfig {
+    /// Socket address the admin listener binds to (e.g. `"127.0.0.1:9090"`).
+    pub listen: String,
+}
+
 /// Validated upstream backend descriptor produced from [`UpstreamConfig`].
 #[derive(Debug, Clone)]
 pub struct ValidatedUpstream {
@@ -411,6 +426,9 @@ pub struct RuntimeConfig {
     pub health_check_cooldown: Duration,
     /// Per-IP rate limiting configuration. `None` disables rate limiting.
     pub rate_limit: Option<RateLimitConfig>,
+    /// Admin listener bind address for metrics and health probes. `None`
+    /// disables the admin server.
+    pub admin_listen: Option<SocketAddr>,
     /// Graceful shutdown drain timeout. After signal receipt, in-flight
     /// requests have this long to complete before forced termination.
     pub shutdown_timeout: Duration,
@@ -619,6 +637,24 @@ impl Config {
                 Duration::from_secs(hc.cooldown)
             });
 
+        let admin_listen = self
+            .admin
+            .as_ref()
+            .map(|a| {
+                a.listen.parse::<SocketAddr>().map_err(|e| {
+                    ProxyError::Config(format!(
+                        "invalid admin listen address \"{}\": {e}",
+                        a.listen
+                    ))
+                })
+            })
+            .transpose()?;
+        if admin_listen == Some(listen) {
+            return Err(ProxyError::Config(
+                "admin.listen must differ from the data-plane listen address".into(),
+            ));
+        }
+
         let shutdown_timeout = self
             .shutdown_timeout
             .map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_secs);
@@ -646,6 +682,7 @@ impl Config {
             healthy_threshold,
             health_check_cooldown,
             rate_limit: self.rate_limit,
+            admin_listen,
             shutdown_timeout,
         })
     }
@@ -1052,6 +1089,57 @@ mod tests {
         let config = Config {
             upstreams: single_upstream("http://localhost:3000"),
             listen: Some("not-an-address".into()),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_parses_admin_listen_when_configured() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            admin: Some(AdminConfig {
+                listen: "127.0.0.1:9090".into(),
+            }),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(
+            rt.admin_listen,
+            Some("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn into_runtime_disables_admin_by_default() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.admin_listen, None);
+    }
+
+    #[test]
+    fn into_runtime_rejects_admin_listen_sharing_data_plane_address() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            listen: Some("127.0.0.1:8100".into()),
+            admin: Some(AdminConfig {
+                listen: "127.0.0.1:8100".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn into_runtime_rejects_invalid_admin_listen() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            admin: Some(AdminConfig {
+                listen: "not-an-address".into(),
+            }),
             ..Default::default()
         };
         assert!(config.into_runtime().is_err());

@@ -21,7 +21,8 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 - *Concurrency limiting* with 503 backpressure
 - *Graceful shutdown* with configurable drain timeout
 - *Structured logging* via tracing (pretty or JSON)
-- *Monotonic `X-Request-Id`* on every response
+- *Prometheus metrics and liveness/readiness probes* on a separate admin listener (off by default)
+- *Request correlation* via `X-Request-Id`: a validated inbound id is propagated, otherwise a monotonic one is assigned
 
 ## Quick Start
 
@@ -131,6 +132,11 @@ timeout = 3                      # seconds
 requests_per_second = 100
 burst = 50
 
+# Admin listener for metrics and health probes (optional, off by default).
+# Must bind a different address than the data-plane `listen`.
+# [admin]
+# listen = "127.0.0.1:9090"
+
 # TLS termination (optional)
 # [tls]
 # cert_path = "/path/to/cert.pem"
@@ -138,6 +144,16 @@ burst = 50
 ```
 
 All time values are in **seconds**. Only `listen` and `upstreams` are required; everything else has sensible defaults. In TOML, all top-level keys must precede the `[section]` and `[[upstreams]]` tables.
+
+## Observability
+
+When an `[admin]` listener is configured, the proxy serves operational endpoints on that address, kept separate from the data plane so they are never reachable by proxy clients:
+
+- `GET /metrics` --- Prometheus/OpenMetrics exposition: request counts by status (`palisade_requests_total`), latency histogram (`palisade_request_duration_seconds`), per-upstream health (`palisade_upstream_healthy`), rate-limit rejections (`palisade_rate_limited_requests_total`), and in-flight request / open-connection saturation gauges.
+- `GET /livez` --- process liveness, for container restart probes.
+- `GET /readyz` --- readiness, `200` while at least one upstream is healthy and `503` otherwise, for load-balancer and orchestrator gating.
+
+Every response carries an `X-Request-Id`. A well-formed inbound `X-Request-Id` is propagated for end-to-end correlation, otherwise the proxy assigns a monotonic per-process id.
 
 ## Development
 
