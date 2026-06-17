@@ -746,8 +746,8 @@ mod tests {
 
     #[test]
     fn loads_config_from_file() {
-        let config = Config::load_from_file("./Config.example.toml")
-            .expect("Config.example.toml should be loadable");
+        let config = Config::load_from_file("./config.example.toml")
+            .expect("config.example.toml should be loadable");
 
         assert_eq!(config.listen, Some("127.0.0.1:8100".into()));
         assert_eq!(config.upstreams.len(), 1);

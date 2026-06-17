@@ -35,7 +35,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let config = Config::load_from_file("Config.toml")
+//!     let config = Config::load_from_file("config.toml")
 //!         .and_then(|c| c.into_runtime())
 //!         .expect("valid configuration");
 //!
